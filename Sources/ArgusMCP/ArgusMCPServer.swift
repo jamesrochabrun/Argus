@@ -244,6 +244,112 @@ struct ArgusMCPServer: AsyncParsableCommand {
           ]),
           "required": .array(["duration_seconds"])
         ])
+      ),
+
+      MCPTool(
+        name: "select_screen_region",
+        description: """
+          Opens a visual overlay that lets the user drag to select a screen region.
+          Shows a crosshair cursor with coordinates and a selection rectangle.
+          Returns the coordinates (x, y, width, height) of the selected region.
+          Press ESC to cancel.
+          """,
+        inputSchema: .object([
+          "type": "object",
+          "properties": .object([:]),
+          "required": .array([])
+        ])
+      ),
+
+      MCPTool(
+        name: "record_region",
+        description: """
+          Record a specific region of the screen by coordinates.
+          Use select_screen_region first to get the coordinates interactively,
+          or provide coordinates directly.
+          """,
+        inputSchema: .object([
+          "type": "object",
+          "properties": .object([
+            "x": .object([
+              "type": "integer",
+              "description": "X coordinate of the region (from top-left)"
+            ]),
+            "y": .object([
+              "type": "integer",
+              "description": "Y coordinate of the region (from top-left)"
+            ]),
+            "width": .object([
+              "type": "integer",
+              "description": "Width of the region in pixels"
+            ]),
+            "height": .object([
+              "type": "integer",
+              "description": "Height of the region in pixels"
+            ]),
+            "fps": .object([
+              "type": "integer",
+              "description": "Frames per second (default: 30)"
+            ]),
+            "output_path": .object([
+              "type": "string",
+              "description": "Optional path for the output video file"
+            ])
+          ]),
+          "required": .array(["x", "y", "width", "height"])
+        ])
+      ),
+
+      MCPTool(
+        name: "select_and_record_region",
+        description: """
+          Opens a visual selection overlay, lets the user select a region,
+          then immediately starts recording that region.
+          Perfect for capturing specific parts of the screen like a single window area,
+          a button, or any UI component.
+          """,
+        inputSchema: .object([
+          "type": "object",
+          "properties": .object([
+            "fps": .object([
+              "type": "integer",
+              "description": "Frames per second (default: 60)"
+            ]),
+            "duration_seconds": .object([
+              "type": "integer",
+              "description": "Optional: Auto-stop after this many seconds"
+            ])
+          ]),
+          "required": .array([])
+        ])
+      ),
+
+      MCPTool(
+        name: "select_record_and_analyze",
+        description: """
+          Complete workflow: Opens visual selection, records the selected region
+          for the specified duration, then analyzes it with OpenAI Vision.
+          Perfect for testing specific UI areas or animations.
+          """,
+        inputSchema: .object([
+          "type": "object",
+          "properties": .object([
+            "duration_seconds": .object([
+              "type": "integer",
+              "description": "Duration to record in seconds"
+            ]),
+            "mode": .object([
+              "type": "string",
+              "description": "Analysis mode: 'test_animation', 'find_bugs', 'accessibility', 'explain'",
+              "enum": .array(["test_animation", "find_bugs", "accessibility", "explain"])
+            ]),
+            "custom_prompt": .object([
+              "type": "string",
+              "description": "Optional custom analysis prompt"
+            ])
+          ]),
+          "required": .array(["duration_seconds"])
+        ])
       )
     ]
 
@@ -341,6 +447,29 @@ func handleToolCall(
 
   case "record_simulator_and_analyze":
     return try await handleRecordSimulatorAndAnalyze(
+      arguments: arguments,
+      frameExtractor: frameExtractor,
+      videoAnalyzer: videoAnalyzer,
+      screenRecorder: screenRecorder
+    )
+
+  case "select_screen_region":
+    return try await handleSelectScreenRegion()
+
+  case "record_region":
+    return try await handleRecordRegion(
+      arguments: arguments,
+      screenRecorder: screenRecorder
+    )
+
+  case "select_and_record_region":
+    return try await handleSelectAndRecordRegion(
+      arguments: arguments,
+      screenRecorder: screenRecorder
+    )
+
+  case "select_record_and_analyze":
+    return try await handleSelectRecordAndAnalyze(
       arguments: arguments,
       frameExtractor: frameExtractor,
       videoAnalyzer: videoAnalyzer,
@@ -984,6 +1113,411 @@ func handleRecordSimulatorAndAnalyze(
 
   return """
     iOS Simulator recording completed and analyzed.
+    Video file: \(videoURL.path)
+    Duration: \(durationSeconds) seconds
+    Analysis mode: \(mode)
+
+    \(formatAnalysisResult(extraction: extractionResult, analysis: analysisResult))
+    """
+}
+
+// MARK: - Region Selection Handlers
+
+/// Result from the argus-select helper tool
+struct SelectionResult: Codable {
+  let x: Int
+  let y: Int
+  let width: Int
+  let height: Int
+  let screenWidth: Int
+  let screenHeight: Int
+  let cancelled: Bool
+}
+
+/// Get the path to the argus-select binary
+func getArgusSelectPath() -> String {
+  // First check if we're in a development environment
+  let executableURL = Bundle.main.executableURL
+  if let bundlePath = executableURL?.deletingLastPathComponent().path {
+    let devPath = bundlePath + "/argus-select"
+    if FileManager.default.fileExists(atPath: devPath) {
+      return devPath
+    }
+  }
+
+  // Check common installation paths
+  let possiblePaths = [
+    "/usr/local/bin/argus-select",
+    "/opt/homebrew/bin/argus-select",
+    ProcessInfo.processInfo.environment["HOME"].map { $0 + "/.local/bin/argus-select" },
+    // Same directory as argus-mcp
+    executableURL?.deletingLastPathComponent().appendingPathComponent("argus-select").path
+  ].compactMap { $0 }
+
+  for path in possiblePaths {
+    if FileManager.default.fileExists(atPath: path) {
+      return path
+    }
+  }
+
+  // Default to assuming it's in PATH
+  return "argus-select"
+}
+
+/// Launch the visual region selector and return the selection
+func launchRegionSelector() async throws -> SelectionResult {
+  let selectPath = getArgusSelectPath()
+
+  let process = Process()
+  process.executableURL = URL(fileURLWithPath: selectPath)
+
+  let outputPipe = Pipe()
+  let errorPipe = Pipe()
+  process.standardOutput = outputPipe
+  process.standardError = errorPipe
+
+  try process.run()
+  process.waitUntilExit()
+
+  let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
+
+  guard process.terminationStatus == 0 else {
+    let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+    let errorString = String(data: errorData, encoding: .utf8) ?? "Unknown error"
+    throw ToolError.invalidArgument("Region selection failed: \(errorString)")
+  }
+
+  guard let result = try? JSONDecoder().decode(SelectionResult.self, from: outputData) else {
+    throw ToolError.invalidArgument("Failed to parse selection result")
+  }
+
+  return result
+}
+
+func handleSelectScreenRegion() async throws -> String {
+  let result = try await launchRegionSelector()
+
+  if result.cancelled {
+    return """
+      Selection cancelled by user.
+      No region was selected.
+      """
+  }
+
+  return """
+    Region selected successfully!
+
+    Coordinates:
+    - X: \(result.x)
+    - Y: \(result.y)
+    - Width: \(result.width)
+    - Height: \(result.height)
+
+    Screen size: \(result.screenWidth) x \(result.screenHeight)
+
+    You can now use 'record_region' with these coordinates to start recording.
+    """
+}
+
+func handleRecordRegion(
+  arguments: [String: Value],
+  screenRecorder: ScreenRecorder
+) async throws -> String {
+  guard let x = arguments["x"]?.intValue,
+        let y = arguments["y"]?.intValue,
+        let width = arguments["width"]?.intValue,
+        let height = arguments["height"]?.intValue else {
+    throw ToolError.missingArgument("x, y, width, and height are required")
+  }
+
+  var fps = 30
+  if let f = arguments["fps"]?.intValue {
+    fps = f
+  }
+
+  var outputPath: String?
+  if let path = arguments["output_path"]?.stringValue {
+    outputPath = path
+  }
+
+  let region = CGRect(x: x, y: y, width: width, height: height)
+
+  let config = ScreenRecorder.RecordingConfig(
+    width: width,
+    height: height,
+    fps: fps,
+    showsCursor: true,
+    capturesAudio: false,
+    quality: .high
+  )
+
+  let url = try await screenRecorder.startRecording(
+    region: region,
+    config: config,
+    outputPath: outputPath
+  )
+
+  return """
+    Started recording screen region.
+    Region: \(x), \(y) - \(width)x\(height)
+    Output file: \(url.path)
+    FPS: \(fps)
+
+    Use 'stop_screen_recording' to stop and save the recording.
+    """
+}
+
+func handleSelectAndRecordRegion(
+  arguments: [String: Value],
+  screenRecorder: ScreenRecorder
+) async throws -> String {
+  // First, launch the visual selector
+  let selection = try await launchRegionSelector()
+
+  if selection.cancelled {
+    return """
+      Selection cancelled by user.
+      No recording started.
+      """
+  }
+
+  var fps = 60
+  if let f = arguments["fps"]?.intValue {
+    fps = f
+  }
+
+  let region = CGRect(
+    x: selection.x,
+    y: selection.y,
+    width: selection.width,
+    height: selection.height
+  )
+
+  let config = ScreenRecorder.RecordingConfig(
+    width: selection.width,
+    height: selection.height,
+    fps: fps,
+    showsCursor: true,
+    capturesAudio: false,
+    quality: .high
+  )
+
+  let url = try await screenRecorder.startRecording(
+    region: region,
+    config: config,
+    outputPath: nil
+  )
+
+  // Handle optional auto-stop duration
+  if let durationSeconds = arguments["duration_seconds"]?.intValue {
+    Task {
+      try await Task.sleep(for: .seconds(durationSeconds))
+      _ = try? await screenRecorder.stopRecording()
+    }
+
+    return """
+      Region selected and recording started!
+
+      Selected region: \(selection.x), \(selection.y) - \(selection.width)x\(selection.height)
+      Output file: \(url.path)
+      FPS: \(fps)
+      Auto-stop: \(durationSeconds) seconds
+
+      Recording will automatically stop after \(durationSeconds) seconds,
+      or use 'stop_screen_recording' to stop early.
+      """
+  }
+
+  return """
+    Region selected and recording started!
+
+    Selected region: \(selection.x), \(selection.y) - \(selection.width)x\(selection.height)
+    Output file: \(url.path)
+    FPS: \(fps)
+
+    Use 'stop_screen_recording' to stop and save the recording.
+    """
+}
+
+func handleSelectRecordAndAnalyze(
+  arguments: [String: Value],
+  frameExtractor: VideoFrameExtractor,
+  videoAnalyzer: VideoAnalyzer,
+  screenRecorder: ScreenRecorder
+) async throws -> String {
+  guard let durationSeconds = arguments["duration_seconds"]?.intValue else {
+    throw ToolError.missingArgument("duration_seconds")
+  }
+
+  // First, launch the visual selector
+  let selection = try await launchRegionSelector()
+
+  if selection.cancelled {
+    return """
+      Selection cancelled by user.
+      No recording or analysis performed.
+      """
+  }
+
+  let region = CGRect(
+    x: selection.x,
+    y: selection.y,
+    width: selection.width,
+    height: selection.height
+  )
+
+  // Configure recording (60fps for animations)
+  let recordingConfig = ScreenRecorder.RecordingConfig(
+    width: selection.width,
+    height: selection.height,
+    fps: 60,
+    showsCursor: true,
+    capturesAudio: false,
+    quality: .high
+  )
+
+  // Start recording
+  _ = try await screenRecorder.startRecording(
+    region: region,
+    config: recordingConfig,
+    outputPath: nil
+  )
+
+  // Wait for the specified duration
+  try await Task.sleep(for: .seconds(durationSeconds))
+
+  // Stop recording
+  let videoURL = try await screenRecorder.stopRecording()
+
+  // Determine analysis mode
+  let mode = arguments["mode"]?.stringValue ?? "explain"
+
+  var analysisConfig: VideoAnalyzer.AnalysisConfig
+  var framesPerSecond: Double
+  var maxFrames: Int
+  var targetWidth: Int
+  var compressionQuality: Double
+
+  switch mode {
+  case "test_animation":
+    analysisConfig = VideoAnalyzer.AnalysisConfig(
+      batchSize: 10,
+      model: "gpt-4o-mini",
+      maxTokensPerBatch: 2000,
+      systemPrompt: """
+        You are a QA engineer testing UI animations in a selected screen region. Analyze these sequential frames and report:
+        1. TIMING: Estimate the easing curve (ease-in, ease-out, ease-in-out, linear, spring/bounce)
+        2. SMOOTHNESS: Any dropped frames, stutters, or jerky motion?
+        3. CONSISTENCY: Does the animation maintain consistent speed/acceleration?
+        4. START/END STATES: Are initial and final positions correct?
+        5. ISSUES: Any visual glitches, clipping, z-index problems, or artifacts?
+        Be precise with frame numbers and timestamps when reporting issues.
+        """,
+      imageDetail: "high",
+      temperature: 0.1
+    )
+    framesPerSecond = 60.0
+    maxFrames = min(durationSeconds * 60, 180)
+    targetWidth = 1024
+    compressionQuality = 0.75
+
+  case "find_bugs":
+    analysisConfig = VideoAnalyzer.AnalysisConfig(
+      batchSize: 5,
+      model: "gpt-4o-mini",
+      maxTokensPerBatch: 1500,
+      systemPrompt: """
+        You are a QA engineer looking for bugs in this screen region. Look for:
+        1. VISUAL BUGS: Glitches, artifacts, incorrect rendering, clipping issues
+        2. UI ISSUES: Misaligned elements, overlapping content, broken layouts
+        3. TEXT PROBLEMS: Truncation, overflow, incorrect formatting
+        4. STATE ERRORS: Wrong colors, missing elements, incorrect data
+        5. ANIMATION ISSUES: Stutters, jumps, incomplete transitions
+        Report each issue with the frame number/timestamp and specific location.
+        """,
+      imageDetail: "high",
+      temperature: 0.1
+    )
+    framesPerSecond = 2.0
+    maxFrames = min(durationSeconds * 2, 60)
+    targetWidth = 1920
+    compressionQuality = 0.9
+
+  case "accessibility":
+    analysisConfig = VideoAnalyzer.AnalysisConfig(
+      batchSize: 5,
+      model: "gpt-4o-mini",
+      maxTokensPerBatch: 1500,
+      systemPrompt: """
+        Evaluate this screen region for accessibility concerns:
+        1. TEXT: Is text readable? Appropriate size? Sufficient contrast?
+        2. COLORS: Are there contrast issues? Color-only indicators?
+        3. TOUCH TARGETS: Are interactive elements large enough (44pt minimum)?
+        4. LABELS: Are UI elements clearly labeled?
+        5. HIERARCHY: Is the visual hierarchy clear?
+        6. MOTION: Any animations that could cause issues for motion-sensitive users?
+        Provide specific recommendations for improvements.
+        """,
+      imageDetail: "high",
+      temperature: 0.2
+    )
+    framesPerSecond = 1.0
+    maxFrames = min(durationSeconds, 30)
+    targetWidth = 1920
+    compressionQuality = 0.9
+
+  default:  // "explain" or unknown
+    analysisConfig = VideoAnalyzer.AnalysisConfig(
+      batchSize: 5,
+      model: "gpt-4o-mini",
+      maxTokensPerBatch: 1500,
+      systemPrompt: """
+        Explain what happens in this screen recording. Describe:
+        1. The overall content and context
+        2. Step-by-step actions and events
+        3. Important UI elements, text, and visual information
+        4. The purpose and outcome of what's shown
+        Be thorough and educational in your explanation.
+        """,
+      imageDetail: "auto",
+      temperature: 0.3
+    )
+    framesPerSecond = 1.0
+    maxFrames = 30
+    targetWidth = 1024
+    compressionQuality = 0.8
+  }
+
+  // Apply custom prompt if provided
+  if let customPrompt = arguments["custom_prompt"]?.stringValue {
+    analysisConfig = VideoAnalyzer.AnalysisConfig(
+      batchSize: analysisConfig.batchSize,
+      model: analysisConfig.model,
+      maxTokensPerBatch: analysisConfig.maxTokensPerBatch,
+      systemPrompt: customPrompt,
+      imageDetail: analysisConfig.imageDetail,
+      temperature: analysisConfig.temperature
+    )
+  }
+
+  let extractionConfig = VideoFrameExtractor.ExtractionConfig(
+    framesPerSecond: framesPerSecond,
+    maxFrames: maxFrames,
+    targetWidth: targetWidth,
+    compressionQuality: compressionQuality
+  )
+
+  // Extract and analyze
+  let extractionResult = try await frameExtractor.extractFrames(from: videoURL, config: extractionConfig)
+  let analysisResult = try await videoAnalyzer.analyze(
+    extractionResult: extractionResult,
+    config: analysisConfig
+  )
+
+  return """
+    Screen region recording completed and analyzed!
+
+    Selected region: \(selection.x), \(selection.y) - \(selection.width)x\(selection.height)
     Video file: \(videoURL.path)
     Duration: \(durationSeconds) seconds
     Analysis mode: \(mode)
