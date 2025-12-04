@@ -42,6 +42,7 @@ class SelectionView: NSView {
   private var currentPoint: NSPoint?
   private var isSelecting = false
   private var crosshairPosition: NSPoint?
+  nonisolated(unsafe) private var keyMonitor: Any?
 
   private let selectionColor = NSColor.systemBlue
   private let crosshairColor = NSColor.white
@@ -55,11 +56,19 @@ class SelectionView: NSView {
   override init(frame frameRect: NSRect) {
     super.init(frame: frameRect)
     setupTrackingArea()
+    setupKeyMonitor()
   }
 
   required init?(coder: NSCoder) {
     super.init(coder: coder)
     setupTrackingArea()
+    setupKeyMonitor()
+  }
+
+  deinit {
+    if let monitor = keyMonitor {
+      NSEvent.removeMonitor(monitor)
+    }
   }
 
   private func setupTrackingArea() {
@@ -70,6 +79,24 @@ class SelectionView: NSView {
       userInfo: nil
     )
     addTrackingArea(trackingArea)
+  }
+
+  private func setupKeyMonitor() {
+    keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+      if event.keyCode == 53 { // ESC key
+        self?.cancelAndExit()
+        return nil  // Consume the event
+      }
+      return event
+    }
+  }
+
+  private func cancelAndExit() {
+    isSelecting = false
+    startPoint = nil
+    currentPoint = nil
+    needsDisplay = true
+    onCancel?()
   }
 
   override func draw(_ dirtyRect: NSRect) {
@@ -292,8 +319,13 @@ class SelectionView: NSView {
 
   override func keyDown(with event: NSEvent) {
     if event.keyCode == 53 { // ESC key
-      onCancel?()
+      cancelAndExit()
     }
+  }
+
+  override func flagsChanged(with event: NSEvent) {
+    // Handle modifier keys if needed, but don't block ESC
+    super.flagsChanged(with: event)
   }
 }
 
@@ -359,18 +391,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
   @MainActor
   private func cancelSelection() {
-    let result = SelectionResult(
-      x: 0,
-      y: 0,
-      width: 0,
-      height: 0,
-      screenWidth: 0,
-      screenHeight: 0,
-      cancelled: true
-    )
+    // Brief delay to allow UI to visually clear before terminating
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+      let result = SelectionResult(
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0,
+        screenWidth: 0,
+        screenHeight: 0,
+        cancelled: true
+      )
 
-    outputResult(result)
-    NSApp.terminate(nil)
+      self.outputResult(result)
+      NSApp.terminate(nil)
+    }
   }
 
   private func outputResult(_ result: SelectionResult) {
