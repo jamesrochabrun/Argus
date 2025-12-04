@@ -94,13 +94,14 @@ public actor ScreenRecorder {
   /// Get available displays
   public func getAvailableDisplays() async throws -> [DisplayInfo] {
     let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+    let mainDisplayID = await MainActor.run { CGMainDisplayID() }
 
     return content.displays.map { display in
       DisplayInfo(
         displayID: display.displayID,
         width: display.width,
         height: display.height,
-        isMain: display.displayID == CGMainDisplayID()
+        isMain: display.displayID == mainDisplayID
       )
     }
   }
@@ -137,7 +138,8 @@ public actor ScreenRecorder {
 
     // Get the main display
     let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-    guard let mainDisplay = content.displays.first(where: { $0.displayID == CGMainDisplayID() }) ?? content.displays.first else {
+    let mainDisplayID = await MainActor.run { CGMainDisplayID() }
+    guard let mainDisplay = content.displays.first(where: { $0.displayID == mainDisplayID }) ?? content.displays.first else {
       throw RecorderError.noDisplayAvailable
     }
 
@@ -227,7 +229,8 @@ public actor ScreenRecorder {
     state = .preparing
 
     let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-    guard let mainDisplay = content.displays.first(where: { $0.displayID == CGMainDisplayID() }) ?? content.displays.first else {
+    let mainDisplayID = await MainActor.run { CGMainDisplayID() }
+    guard let mainDisplay = content.displays.first(where: { $0.displayID == mainDisplayID }) ?? content.displays.first else {
       throw RecorderError.noDisplayAvailable
     }
 
