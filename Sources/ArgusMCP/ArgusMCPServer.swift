@@ -1,3 +1,4 @@
+import AppKit
 import ArgumentParser
 import Foundation
 import MCP
@@ -15,6 +16,13 @@ struct ArgusMCPServer: AsyncParsableCommand {
   )
 
   mutating func run() async throws {
+    // Initialize NSApplication to establish window server connection
+    // This is required for ScreenCaptureKit to work in a headless context
+    await MainActor.run {
+      _ = NSApplication.shared
+      NSApp.setActivationPolicy(.accessory)  // Run as background app (no dock icon)
+    }
+
     // Get API key from environment
     guard let apiKey = ProcessInfo.processInfo.environment["OPENAI_API_KEY"] else {
       FileHandle.standardError.write("Error: OPENAI_API_KEY environment variable not set\n".data(using: .utf8)!)
@@ -23,7 +31,7 @@ struct ArgusMCPServer: AsyncParsableCommand {
 
     let frameExtractor = VideoFrameExtractor()
     let videoAnalyzer = VideoAnalyzer(apiKey: apiKey)
-    let screenRecorder = ScreenRecorder()
+    let screenRecorder = await MainActor.run { ScreenRecorder() }
 
     // Define tools with Value-based input schemas
     let tools: [MCPTool] = [

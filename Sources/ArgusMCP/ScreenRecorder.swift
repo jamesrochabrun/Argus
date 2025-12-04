@@ -4,8 +4,10 @@ import ScreenCaptureKit
 
 /// Screen recorder using ScreenCaptureKit for macOS
 /// Captures screen content and saves to video file
+/// NOTE: ScreenCaptureKit requires window server connection, so this must run on MainActor
 @available(macOS 14.0, *)
-public actor ScreenRecorder {
+@MainActor
+public final class ScreenRecorder {
 
   /// Recording configuration
   public struct RecordingConfig: Sendable {
@@ -92,9 +94,10 @@ public actor ScreenRecorder {
   public init() {}
 
   /// Get available displays
+
   public func getAvailableDisplays() async throws -> [DisplayInfo] {
     let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-    let mainDisplayID = await MainActor.run { CGMainDisplayID() }
+    let mainDisplayID = CGMainDisplayID()
 
     return content.displays.map { display in
       DisplayInfo(
@@ -107,6 +110,7 @@ public actor ScreenRecorder {
   }
 
   /// Get available windows
+
   public func getAvailableWindows() async throws -> [WindowInfo] {
     let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
 
@@ -126,6 +130,7 @@ public actor ScreenRecorder {
   }
 
   /// Start recording the main display
+
   public func startRecording(
     config: RecordingConfig = .default,
     outputPath: String? = nil
@@ -138,7 +143,7 @@ public actor ScreenRecorder {
 
     // Get the main display
     let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-    let mainDisplayID = await MainActor.run { CGMainDisplayID() }
+    let mainDisplayID = CGMainDisplayID()
     guard let mainDisplay = content.displays.first(where: { $0.displayID == mainDisplayID }) ?? content.displays.first else {
       throw RecorderError.noDisplayAvailable
     }
@@ -147,6 +152,7 @@ public actor ScreenRecorder {
   }
 
   /// Start recording a specific display
+
   public func startRecording(
     displayID: CGDirectDisplayID,
     config: RecordingConfig = .default,
@@ -167,6 +173,7 @@ public actor ScreenRecorder {
   }
 
   /// Start recording a specific window
+
   public func startRecording(
     windowID: CGWindowID,
     config: RecordingConfig = .default,
@@ -187,6 +194,7 @@ public actor ScreenRecorder {
   }
 
   /// Start recording a window by app name (e.g., "Simulator", "Safari")
+
   public func startRecording(
     appName: String,
     config: RecordingConfig = .default,
@@ -217,6 +225,7 @@ public actor ScreenRecorder {
   }
 
   /// Start recording a specific region of the screen
+
   public func startRecording(
     region: CGRect,
     config: RecordingConfig = .default,
@@ -229,7 +238,7 @@ public actor ScreenRecorder {
     state = .preparing
 
     let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-    let mainDisplayID = await MainActor.run { CGMainDisplayID() }
+    let mainDisplayID = CGMainDisplayID()
     guard let mainDisplay = content.displays.first(where: { $0.displayID == mainDisplayID }) ?? content.displays.first else {
       throw RecorderError.noDisplayAvailable
     }
@@ -256,6 +265,7 @@ public actor ScreenRecorder {
   }
 
   /// Find the iOS Simulator window
+
   public func findSimulatorWindow() async throws -> WindowInfo {
     let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
 
@@ -280,6 +290,7 @@ public actor ScreenRecorder {
     )
   }
 
+
   private func startRecording(
     display: SCDisplay,
     config: RecordingConfig,
@@ -290,6 +301,7 @@ public actor ScreenRecorder {
 
     return try await setupAndStartRecording(filter: filter, config: config, outputPath: outputPath, cropRect: nil)
   }
+
 
   private func startRecording(
     window: SCWindow,
@@ -316,6 +328,7 @@ public actor ScreenRecorder {
 
     return try await setupAndStartRecording(filter: filter, config: effectiveConfig, outputPath: outputPath, cropRect: nil)
   }
+
 
   private func setupAndStartRecording(
     filter: SCContentFilter,
