@@ -296,7 +296,22 @@ public actor ScreenRecorder {
     // Create content filter for the window
     let filter = SCContentFilter(desktopIndependentWindow: window)
 
-    return try await setupAndStartRecording(filter: filter, config: config, outputPath: outputPath, cropRect: nil)
+    // Use window dimensions if config has 0 width/height
+    let effectiveConfig: RecordingConfig
+    if config.width == 0 || config.height == 0 {
+      effectiveConfig = RecordingConfig(
+        width: Int(window.frame.width),
+        height: Int(window.frame.height),
+        fps: config.fps,
+        showsCursor: config.showsCursor,
+        capturesAudio: config.capturesAudio,
+        quality: config.quality
+      )
+    } else {
+      effectiveConfig = config
+    }
+
+    return try await setupAndStartRecording(filter: filter, config: effectiveConfig, outputPath: outputPath, cropRect: nil)
   }
 
   private func setupAndStartRecording(
