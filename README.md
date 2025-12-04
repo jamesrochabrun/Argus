@@ -72,13 +72,76 @@ Argus supports 6 analysis modes, each optimized for different use cases:
 4. **Analysis**: GPT-4o-mini analyzes using mode-specific prompts
 5. **Report**: Results are combined into a structured report
 
-### Cost Estimation
+### Token Usage & Cost Estimation
 
-For a 3-second video:
-- `quick_look`: ~2 frames → 1 API call → ~$0.001
-- `explain`: ~3 frames → 1 API call → ~$0.002
-- `test_animation`: ~180 frames → 18 API calls → ~$0.05
-- `find_bugs`: ~6 frames → 2 API calls → ~$0.004
+> **⚠️ IMPORTANT: Token usage varies dramatically between modes. Choose the right mode for your use case to avoid unexpected costs.**
+
+#### Token Usage by Mode (3-second video example)
+
+| Mode | Frames Sent | API Calls | Est. Input Tokens | Est. Output Tokens | Est. Cost |
+|------|-------------|-----------|-------------------|-------------------|-----------|
+| `quick_look` | 2 | 1 | ~1,500 | ~200 | ~$0.001 |
+| `explain` | 3 | 1 | ~2,500 | ~600 | ~$0.002 |
+| `find_bugs` | 6 | 2 | ~8,000 | ~1,200 | ~$0.006 |
+| `accessibility` | 3 | 1 | ~4,000 | ~800 | ~$0.003 |
+| `test_animation` | 180 | 18 | ~120,000 | ~12,000 | ~$0.08 |
+| `compare_frames` | 90 | 15 | ~90,000 | ~10,000 | ~$0.06 |
+
+#### Token Usage Disclaimers
+
+**🔴 High Token Usage Modes:**
+
+- **`test_animation`**: Captures at 60fps and can send up to **180 frames** per analysis. Each frame is a base64 JPEG image (~85 tokens per image at 1024px). For a 3-second recording, expect **~120,000 input tokens**.
+
+- **`compare_frames`**: Captures at 30fps with up to **120 frames**. Designed for detailed pixel comparison, uses high-detail image mode. Expect **~90,000 input tokens** for a 4-second video.
+
+**🟡 Medium Token Usage Modes:**
+
+- **`find_bugs`**: Captures at 2fps with high resolution (1920px). More tokens per image due to larger size. Expect **~8,000-15,000 input tokens** for typical recordings.
+
+- **`accessibility`**: Similar to find_bugs but fewer frames. Expect **~4,000-8,000 input tokens**.
+
+**🟢 Low Token Usage Modes:**
+
+- **`quick_look`**: Minimal frames (0.5fps), low resolution (512px), low detail mode. Most economical option. Expect **~1,500-3,000 input tokens**.
+
+- **`explain`**: Balanced approach with 1fps and auto detail. Expect **~2,500-5,000 input tokens**.
+
+#### How Image Tokens Are Calculated
+
+OpenAI Vision API charges tokens based on image size and detail level:
+
+| Detail Level | Approximate Tokens per Image |
+|--------------|------------------------------|
+| `low` | ~85 tokens (fixed) |
+| `auto` | ~85-1,105 tokens (varies) |
+| `high` | ~1,105+ tokens (scales with resolution) |
+
+**Formula for `high` detail:**
+```
+tokens = 85 + (170 × number_of_512px_tiles)
+```
+
+For a 1024×1024 image at high detail: `85 + (170 × 4) = 765 tokens`
+For a 1920×1080 image at high detail: `85 + (170 × 8) = 1,445 tokens`
+
+#### Recommendations
+
+| Use Case | Recommended Mode | Why |
+|----------|------------------|-----|
+| "What's in this video?" | `quick_look` | Cheapest, fastest |
+| "Explain the user flow" | `explain` | Good balance |
+| "Check for visual bugs" | `find_bugs` | Worth the extra tokens for bug detection |
+| "Test this animation" | `test_animation` | **Use only when you need frame-by-frame analysis** |
+| "Is this accessible?" | `accessibility` | Focused analysis, reasonable cost |
+| "What changed between states?" | `compare_frames` | **Use for short clips only (1-2 seconds)** |
+
+#### Cost Control Tips
+
+1. **Start with `quick_look`** - Use it first to see if deeper analysis is needed
+2. **Limit recording duration** - For `test_animation`, keep recordings under 3 seconds
+3. **Use region selection** - Record only the specific UI component, not full screen
+4. **Custom `max_frames`** - Override default with lower values: `max_frames: 30`
 
 ---
 
