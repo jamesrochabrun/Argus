@@ -500,18 +500,10 @@ MEASUREMENTS:
 | Tool | Description |
 |------|-------------|
 | `analyze_video` | Analyze a video file with specified mode |
-| `start_screen_recording` | Start recording the screen |
-| `stop_screen_recording` | Stop recording and save |
-| `record_and_analyze` | Record for N seconds, then analyze |
-| `record_app` | Record a specific application window |
-| `record_simulator` | Record iOS Simulator (60fps) |
-| `record_simulator_and_analyze` | Record Simulator + analyze |
-| `select_screen_region` | Visual crosshair to select a region |
-| `record_region` | Record a specific region by coordinates |
-| `select_and_record_region` | Select region visually, then record |
-| `select_record_and_analyze` | Select + record + analyze (full workflow) |
-| `list_displays` | List available displays |
-| `list_windows` | List available windows |
+| `record_and_analyze` | Record screen for N seconds, then analyze |
+| `record_simulator_and_analyze` | Record iOS Simulator + analyze |
+| `record_app_and_analyze` | Record any app window + analyze |
+| `select_record_and_analyze` | Select region + record + analyze |
 
 ---
 
