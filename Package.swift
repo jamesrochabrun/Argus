@@ -9,6 +9,7 @@ let package = Package(
   products: [
     .executable(name: "argus-mcp", targets: ["ArgusMCP"]),
     .executable(name: "argus-select", targets: ["ArgusSelect"]),
+    .executable(name: "argus-status", targets: ["ArgusRecordingStatus"]),
   ],
   dependencies: [
     .package(url: "https://github.com/modelcontextprotocol/swift-sdk", from: "0.7.1"),
@@ -29,6 +30,10 @@ let package = Package(
       dependencies: [
         .product(name: "ArgumentParser", package: "swift-argument-parser"),
       ]
+    ),
+    .executableTarget(
+      name: "ArgusRecordingStatus",
+      dependencies: []
     ),
   ]
 )

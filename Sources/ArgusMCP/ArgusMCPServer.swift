@@ -6,6 +6,61 @@ import SwiftOpenAI
 // Type alias to disambiguate Tool types
 typealias MCPTool = MCP.Tool
 
+// MARK: - Recording Session State
+
+/// Manages the recording status UI across start/stop calls
+@MainActor
+final class RecordingSession {
+  static let shared = RecordingSession()
+
+  private var statusUI: RecordingStatusUI?
+  private var uiEventTask: Task<Void, Never>?
+
+  private init() {}
+
+  /// Start the status UI for a recording session
+  func startUI(durationSeconds: Int? = nil, onStopRequested: @escaping () async -> Void) async {
+    // Clean up any existing UI
+    await stopUI()
+
+    statusUI = RecordingStatusUI()
+
+    do {
+      let events = try await statusUI!.launch(config: .init(durationSeconds: durationSeconds))
+
+      // Listen for UI events in background
+      uiEventTask = Task {
+        for await event in events {
+          switch event {
+          case .stopClicked, .timeout:
+            await onStopRequested()
+            return
+          case .ready, .processExited:
+            break
+          }
+        }
+      }
+    } catch {
+      FileHandle.standardError.write("Warning: Could not launch recording status UI: \(error)\n".data(using: .utf8)!)
+      statusUI = nil
+    }
+  }
+
+  /// Notify that recording has started (first frame captured)
+  func notifyRecordingStarted() async {
+    await statusUI?.notifyRecordingStarted()
+  }
+
+  /// Stop the status UI
+  func stopUI() async {
+    uiEventTask?.cancel()
+    uiEventTask = nil
+    await statusUI?.notifyRecordingStopped()
+    statusUI?.terminate()
+    statusUI = nil
+  }
+}
+
 @main
 struct ArgusMCPServer: AsyncParsableCommand {
   static let configuration = CommandConfiguration(
@@ -72,72 +127,6 @@ struct ArgusMCPServer: AsyncParsableCommand {
       ),
 
       MCPTool(
-        name: "start_screen_recording",
-        description: """
-          Start recording the screen using ScreenCaptureKit.
-          Records the main display by default. Returns the path where the recording will be saved.
-          Use stop_screen_recording to stop and finalize the recording.
-          """,
-        inputSchema: .object([
-          "type": "object",
-          "properties": .object([
-            "output_path": .object([
-              "type": "string",
-              "description": "Optional path for the output video file"
-            ]),
-            "width": .object([
-              "type": "integer",
-              "description": "Recording width in pixels (default: 1920)"
-            ]),
-            "height": .object([
-              "type": "integer",
-              "description": "Recording height in pixels (default: 1080)"
-            ]),
-            "fps": .object([
-              "type": "integer",
-              "description": "Frames per second (default: 30)"
-            ]),
-            "quality": .object([
-              "type": "string",
-              "description": "Recording quality: 'low', 'medium', or 'high'",
-              "enum": .array(["low", "medium", "high"])
-            ])
-          ]),
-          "required": .array([])
-        ])
-      ),
-
-      MCPTool(
-        name: "stop_screen_recording",
-        description: "Stop the current screen recording and return the path to the saved video file.",
-        inputSchema: .object([
-          "type": "object",
-          "properties": .object([:]),
-          "required": .array([])
-        ])
-      ),
-
-      MCPTool(
-        name: "list_displays",
-        description: "List all available displays for screen recording.",
-        inputSchema: .object([
-          "type": "object",
-          "properties": .object([:]),
-          "required": .array([])
-        ])
-      ),
-
-      MCPTool(
-        name: "list_windows",
-        description: "List all available windows for screen recording.",
-        inputSchema: .object([
-          "type": "object",
-          "properties": .object([:]),
-          "required": .array([])
-        ])
-      ),
-
-      MCPTool(
         name: "record_and_analyze",
         description: """
           Start a screen recording, wait for the specified duration, stop recording,
@@ -162,60 +151,6 @@ struct ArgusMCPServer: AsyncParsableCommand {
             ])
           ]),
           "required": .array(["duration_seconds"])
-        ])
-      ),
-
-      MCPTool(
-        name: "record_app",
-        description: """
-          Record a specific application window by name (e.g., 'Simulator', 'Safari', 'Chrome').
-          This captures only that app's window, not the entire screen.
-          Use stop_screen_recording to stop.
-          """,
-        inputSchema: .object([
-          "type": "object",
-          "properties": .object([
-            "app_name": .object([
-              "type": "string",
-              "description": "Name of the application to record (e.g., 'Simulator', 'Safari')"
-            ]),
-            "fps": .object([
-              "type": "integer",
-              "description": "Frames per second (default: 60 for animations, 30 for general use)"
-            ]),
-            "output_path": .object([
-              "type": "string",
-              "description": "Optional path for the output video file"
-            ])
-          ]),
-          "required": .array(["app_name"])
-        ])
-      ),
-
-      MCPTool(
-        name: "record_simulator",
-        description: """
-          Record the iOS Simulator window. Optimized for capturing animations at 60fps.
-          Perfect for testing UI animations, transitions, and interactions.
-          Use stop_screen_recording to stop.
-          """,
-        inputSchema: .object([
-          "type": "object",
-          "properties": .object([
-            "fps": .object([
-              "type": "integer",
-              "description": "Frames per second (default: 60)"
-            ]),
-            "duration_seconds": .object([
-              "type": "integer",
-              "description": "Optional: Auto-stop after this many seconds"
-            ]),
-            "output_path": .object([
-              "type": "string",
-              "description": "Optional path for the output video file"
-            ])
-          ]),
-          "required": .array([])
         ])
       ),
 
@@ -247,93 +182,18 @@ struct ArgusMCPServer: AsyncParsableCommand {
       ),
 
       MCPTool(
-        name: "select_screen_region",
+        name: "record_app_and_analyze",
         description: """
-          Opens a visual overlay that lets the user drag to select a screen region.
-          Shows a crosshair cursor with coordinates and a selection rectangle.
-          Returns the coordinates (x, y, width, height) of the selected region.
-          Press ESC to cancel.
-          """,
-        inputSchema: .object([
-          "type": "object",
-          "properties": .object([:]),
-          "required": .array([])
-        ])
-      ),
-
-      MCPTool(
-        name: "record_region",
-        description: """
-          Record a specific region of the screen by coordinates.
-          Use select_screen_region first to get the coordinates interactively,
-          or provide coordinates directly.
+          Record a specific application window by name and automatically analyze it with AI.
+          Perfect for testing UI, animations, and interactions in any app (Safari, Chrome, etc.).
           """,
         inputSchema: .object([
           "type": "object",
           "properties": .object([
-            "x": .object([
-              "type": "integer",
-              "description": "X coordinate of the region (from top-left)"
-            ]),
-            "y": .object([
-              "type": "integer",
-              "description": "Y coordinate of the region (from top-left)"
-            ]),
-            "width": .object([
-              "type": "integer",
-              "description": "Width of the region in pixels"
-            ]),
-            "height": .object([
-              "type": "integer",
-              "description": "Height of the region in pixels"
-            ]),
-            "fps": .object([
-              "type": "integer",
-              "description": "Frames per second (default: 30)"
-            ]),
-            "output_path": .object([
+            "app_name": .object([
               "type": "string",
-              "description": "Optional path for the output video file"
-            ])
-          ]),
-          "required": .array(["x", "y", "width", "height"])
-        ])
-      ),
-
-      MCPTool(
-        name: "select_and_record_region",
-        description: """
-          Opens a visual selection overlay, lets the user select a region,
-          then immediately starts recording that region.
-          Perfect for capturing specific parts of the screen like a single window area,
-          a button, or any UI component.
-          """,
-        inputSchema: .object([
-          "type": "object",
-          "properties": .object([
-            "fps": .object([
-              "type": "integer",
-              "description": "Frames per second (default: 60)"
+              "description": "Name of the application to record (e.g., 'Safari', 'Chrome', 'Finder')"
             ]),
-            "duration_seconds": .object([
-              "type": "integer",
-              "description": "Optional: Auto-stop after this many seconds"
-            ])
-          ]),
-          "required": .array([])
-        ])
-      ),
-
-      MCPTool(
-        name: "select_record_and_analyze",
-        description: """
-          Complete workflow: Opens visual selection, records the selected region
-          for the specified duration, then analyzes it with OpenAI Vision.
-          Perfect for testing specific UI areas or animations.
-          """,
-        inputSchema: .object([
-          "type": "object",
-          "properties": .object([
             "duration_seconds": .object([
               "type": "integer",
               "description": "Duration to record in seconds"
@@ -348,7 +208,38 @@ struct ArgusMCPServer: AsyncParsableCommand {
               "description": "Optional custom analysis prompt"
             ])
           ]),
-          "required": .array(["duration_seconds"])
+          "required": .array(["app_name", "duration_seconds"])
+        ])
+      ),
+
+      MCPTool(
+        name: "select_record_and_analyze",
+        description: """
+          Complete workflow: Opens visual selection, records the selected region
+          for the specified duration, then analyzes it with OpenAI Vision.
+          Perfect for testing specific UI areas or animations.
+
+          Two modes:
+          - Timed: Provide duration_seconds for countdown timer that auto-stops
+          - Manual: Omit duration_seconds to show elapsed time; user clicks Stop to end (30s max)
+          """,
+        inputSchema: .object([
+          "type": "object",
+          "properties": .object([
+            "duration_seconds": .object([
+              "type": "integer",
+              "description": "Duration to record in seconds. If omitted, recording runs until user clicks Stop (30s max)."
+            ]),
+            "mode": .object([
+              "type": "string",
+              "description": "Analysis mode: 'test_animation', 'find_bugs', 'accessibility', 'explain'",
+              "enum": .array(["test_animation", "find_bugs", "accessibility", "explain"])
+            ]),
+            "custom_prompt": .object([
+              "type": "string",
+              "description": "Optional custom analysis prompt"
+            ])
+          ])
         ])
       )
     ]
@@ -410,38 +301,11 @@ func handleToolCall(
       videoAnalyzer: videoAnalyzer
     )
 
-  case "start_screen_recording":
-    return try await handleStartRecording(
-      arguments: arguments,
-      screenRecorder: screenRecorder
-    )
-
-  case "stop_screen_recording":
-    return try await handleStopRecording(screenRecorder: screenRecorder)
-
-  case "list_displays":
-    return try await handleListDisplays(screenRecorder: screenRecorder)
-
-  case "list_windows":
-    return try await handleListWindows(screenRecorder: screenRecorder)
-
   case "record_and_analyze":
     return try await handleRecordAndAnalyze(
       arguments: arguments,
       frameExtractor: frameExtractor,
       videoAnalyzer: videoAnalyzer,
-      screenRecorder: screenRecorder
-    )
-
-  case "record_app":
-    return try await handleRecordApp(
-      arguments: arguments,
-      screenRecorder: screenRecorder
-    )
-
-  case "record_simulator":
-    return try await handleRecordSimulator(
-      arguments: arguments,
       screenRecorder: screenRecorder
     )
 
@@ -453,18 +317,11 @@ func handleToolCall(
       screenRecorder: screenRecorder
     )
 
-  case "select_screen_region":
-    return try await handleSelectScreenRegion()
-
-  case "record_region":
-    return try await handleRecordRegion(
+  case "record_app_and_analyze":
+    return try await handleRecordAppAndAnalyze(
       arguments: arguments,
-      screenRecorder: screenRecorder
-    )
-
-  case "select_and_record_region":
-    return try await handleSelectAndRecordRegion(
-      arguments: arguments,
+      frameExtractor: frameExtractor,
+      videoAnalyzer: videoAnalyzer,
       screenRecorder: screenRecorder
     )
 
@@ -678,116 +535,6 @@ func handleAnalyzeVideo(
   return formatAnalysisResult(extraction: extractionResult, analysis: analysisResult)
 }
 
-func handleStartRecording(
-  arguments: [String: Value],
-  screenRecorder: ScreenRecorder
-) async throws -> String {
-  var width = 1920
-  var height = 1080
-  var fps = 30
-  var quality: ScreenRecorder.RecordingConfig.Quality = .medium
-
-  if let w = arguments["width"]?.intValue {
-    width = w
-  }
-
-  if let h = arguments["height"]?.intValue {
-    height = h
-  }
-
-  if let f = arguments["fps"]?.intValue {
-    fps = f
-  }
-
-  if let qualityStr = arguments["quality"]?.stringValue,
-     let q = ScreenRecorder.RecordingConfig.Quality(rawValue: qualityStr)
-  {
-    quality = q
-  }
-
-  let config = ScreenRecorder.RecordingConfig(
-    width: width,
-    height: height,
-    fps: fps,
-    showsCursor: true,
-    capturesAudio: false,
-    quality: quality
-  )
-
-  var outputPath: String?
-  if let path = arguments["output_path"]?.stringValue {
-    outputPath = path
-  }
-
-  let url = try await screenRecorder.startRecording(config: config, outputPath: outputPath)
-
-  return """
-    Screen recording started successfully.
-    Output file: \(url.path)
-    Resolution: \(config.width)x\(config.height)
-    FPS: \(config.fps)
-    Quality: \(config.quality.rawValue)
-
-    Use 'stop_screen_recording' to stop and save the recording.
-    """
-}
-
-func handleStopRecording(screenRecorder: ScreenRecorder) async throws -> String {
-  let url = try await screenRecorder.stopRecording()
-
-  // Get file size
-  let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
-  let fileSize = attributes[.size] as? Int64 ?? 0
-  let fileSizeMB = Double(fileSize) / 1_000_000.0
-
-  return """
-    Screen recording stopped and saved successfully.
-    Output file: \(url.path)
-    File size: \(String(format: "%.2f", fileSizeMB)) MB
-
-    You can now use 'analyze_video' with this path to analyze the recording.
-    """
-}
-
-func handleListDisplays(screenRecorder: ScreenRecorder) async throws -> String {
-  let displays = try await screenRecorder.getAvailableDisplays()
-
-  var result = "Available Displays:\n"
-  for (index, display) in displays.enumerated() {
-    result += """
-      \(index + 1). Display ID: \(display.displayID)
-         Resolution: \(display.width)x\(display.height)
-         Main Display: \(display.isMain ? "Yes" : "No")
-
-      """
-  }
-
-  return result
-}
-
-func handleListWindows(screenRecorder: ScreenRecorder) async throws -> String {
-  let windows = try await screenRecorder.getAvailableWindows()
-
-  var result = "Available Windows:\n"
-  for (index, window) in windows.prefix(20).enumerated() {
-    let title = window.title ?? "Untitled"
-    let owner = window.ownerName ?? "Unknown"
-    result += """
-      \(index + 1). Window ID: \(window.windowID)
-         Title: \(title)
-         Application: \(owner)
-         Size: \(Int(window.frame.width))x\(Int(window.frame.height))
-
-      """
-  }
-
-  if windows.count > 20 {
-    result += "... and \(windows.count - 20) more windows\n"
-  }
-
-  return result
-}
-
 func handleRecordAndAnalyze(
   arguments: [String: Value],
   frameExtractor: VideoFrameExtractor,
@@ -798,14 +545,91 @@ func handleRecordAndAnalyze(
     throw ToolError.missingArgument("duration_seconds")
   }
 
-  // Start recording
-  _ = try await screenRecorder.startRecording()
+  // Enforce max duration of 30 seconds
+  let effectiveDuration = min(durationSeconds, 30)
 
-  // Wait for the specified duration
-  try await Task.sleep(for: .seconds(durationSeconds))
+  // Launch recording status UI
+  let statusUI = await MainActor.run { RecordingStatusUI() }
 
-  // Stop recording
-  let videoURL = try await screenRecorder.stopRecording()
+  // Try to launch UI (continue without it if it fails)
+  let uiEvents: AsyncStream<RecordingStatusUI.UIEvent>?
+  do {
+    uiEvents = try await statusUI.launch(config: .init(durationSeconds: effectiveDuration))
+  } catch {
+    // Log warning but continue without UI
+    FileHandle.standardError.write("Warning: Could not launch recording status UI: \(error)\n".data(using: .utf8)!)
+    uiEvents = nil
+  }
+
+  // Start recording with event stream for precise duration synchronization
+  let eventStream = try await screenRecorder.startRecordingWithEvents()
+
+  var videoURL: URL?
+
+  // Wait for first frame before starting timer
+  for await event in eventStream {
+    switch event {
+    case .started(let url):
+      videoURL = url
+      // Recording infrastructure ready, but don't start timer yet
+
+    case .firstFrameCaptured:
+      // Notify UI that recording has started
+      await statusUI.notifyRecordingStarted()
+
+      // Race between duration timer and UI stop events
+      if let uiEvents = uiEvents {
+        // Use withTaskGroup to race between timer and UI events
+        await withTaskGroup(of: Void.self) { group in
+          // Timer task
+          group.addTask {
+            try? await Task.sleep(for: .seconds(effectiveDuration))
+            _ = try? await screenRecorder.stopRecording()
+          }
+
+          // UI events task
+          group.addTask {
+            for await event in uiEvents {
+              switch event {
+              case .stopClicked, .timeout:
+                _ = try? await screenRecorder.stopRecording()
+                return
+              case .ready, .processExited:
+                break
+              }
+            }
+          }
+
+          // Wait for first task to complete (either timer or stop button)
+          await group.next()
+          // Cancel remaining tasks
+          group.cancelAll()
+        }
+      } else {
+        // No UI, just wait for duration
+        try await Task.sleep(for: .seconds(effectiveDuration))
+        _ = try await screenRecorder.stopRecording()
+      }
+
+    case .stopped(let url):
+      videoURL = url
+      // Notify UI to show analyzing state
+      await statusUI.notifyAnalyzing()
+
+    case .error(let message):
+      await statusUI.notifyError()
+      try? await Task.sleep(for: .seconds(1.5))
+      await MainActor.run { statusUI.terminate() }
+      throw ToolError.invalidArgument(message)
+    }
+  }
+
+  guard let finalURL = videoURL else {
+    await statusUI.notifyError()
+    try? await Task.sleep(for: .seconds(1.5))
+    await MainActor.run { statusUI.terminate() }
+    throw ToolError.invalidArgument("Recording failed - no output URL")
+  }
 
   // Prepare analysis config
   var analysisConfig: VideoAnalyzer.AnalysisConfig = .default
@@ -836,122 +660,35 @@ func handleRecordAndAnalyze(
   }
 
   // Extract and analyze
-  let extractionResult = try await frameExtractor.extractFrames(from: videoURL, config: extractionConfig)
-  let analysisResult = try await videoAnalyzer.analyze(
-    extractionResult: extractionResult,
-    config: analysisConfig
-  )
+  do {
+    let extractionResult = try await frameExtractor.extractFrames(from: finalURL, config: extractionConfig)
+    let analysisResult = try await videoAnalyzer.analyze(
+      extractionResult: extractionResult,
+      config: analysisConfig
+    )
 
-  return """
-    Recording completed and analyzed.
-    Video file: \(videoURL.path)
-    Duration: \(durationSeconds) seconds
+    // Show success state briefly before closing UI
+    await statusUI.notifySuccess()
+    try? await Task.sleep(for: .seconds(1.5))
+    await statusUI.notifyRecordingStopped()
 
-    \(formatAnalysisResult(extraction: extractionResult, analysis: analysisResult))
-    """
+    return """
+      Recording completed and analyzed.
+      Video file: \(finalURL.path)
+      Duration: \(durationSeconds) seconds
+
+      \(formatAnalysisResult(extraction: extractionResult, analysis: analysisResult))
+      """
+  } catch {
+    // Show error state briefly before closing UI
+    await statusUI.notifyError()
+    try? await Task.sleep(for: .seconds(1.5))
+    await statusUI.notifyRecordingStopped()
+    throw error
+  }
 }
 
 // MARK: - App Recording Handlers
-
-func handleRecordApp(
-  arguments: [String: Value],
-  screenRecorder: ScreenRecorder
-) async throws -> String {
-  guard let appName = arguments["app_name"]?.stringValue else {
-    throw ToolError.missingArgument("app_name")
-  }
-
-  var fps = 60  // Default to 60fps for animations
-  if let f = arguments["fps"]?.intValue {
-    fps = f
-  }
-
-  var outputPath: String?
-  if let path = arguments["output_path"]?.stringValue {
-    outputPath = path
-  }
-
-  let config = ScreenRecorder.RecordingConfig(
-    width: 0,  // Will be determined by window size
-    height: 0,
-    fps: fps,
-    showsCursor: true,
-    capturesAudio: false,
-    quality: .high
-  )
-
-  let url = try await screenRecorder.startRecording(
-    appName: appName,
-    config: config,
-    outputPath: outputPath
-  )
-
-  return """
-    Started recording '\(appName)' window.
-    Output file: \(url.path)
-    FPS: \(fps)
-
-    Use 'stop_screen_recording' to stop and save the recording.
-    """
-}
-
-func handleRecordSimulator(
-  arguments: [String: Value],
-  screenRecorder: ScreenRecorder
-) async throws -> String {
-  var fps = 60  // Default to 60fps for simulator animations
-  if let f = arguments["fps"]?.intValue {
-    fps = f
-  }
-
-  var outputPath: String?
-  if let path = arguments["output_path"]?.stringValue {
-    outputPath = path
-  }
-
-  let config = ScreenRecorder.RecordingConfig(
-    width: 0,
-    height: 0,
-    fps: fps,
-    showsCursor: false,  // Hide cursor for simulator recordings
-    capturesAudio: false,
-    quality: .high
-  )
-
-  // Find and record the Simulator window
-  let url = try await screenRecorder.startRecording(
-    appName: "Simulator",
-    config: config,
-    outputPath: outputPath
-  )
-
-  // Handle optional auto-stop duration
-  if let durationSeconds = arguments["duration_seconds"]?.intValue {
-    // Schedule auto-stop
-    Task {
-      try await Task.sleep(for: .seconds(durationSeconds))
-      _ = try? await screenRecorder.stopRecording()
-    }
-
-    return """
-      Started recording iOS Simulator.
-      Output file: \(url.path)
-      FPS: \(fps)
-      Auto-stop: \(durationSeconds) seconds
-
-      Recording will automatically stop after \(durationSeconds) seconds,
-      or use 'stop_screen_recording' to stop early.
-      """
-  }
-
-  return """
-    Started recording iOS Simulator.
-    Output file: \(url.path)
-    FPS: \(fps)
-
-    Use 'stop_screen_recording' to stop and save the recording.
-    """
-}
 
 func handleRecordSimulatorAndAnalyze(
   arguments: [String: Value],
@@ -973,18 +710,37 @@ func handleRecordSimulatorAndAnalyze(
     quality: .high
   )
 
-  // Start recording the Simulator
-  _ = try await screenRecorder.startRecording(
+  // Start recording with event stream for precise duration synchronization
+  let eventStream = try await screenRecorder.startRecordingWithEvents(
     appName: "Simulator",
     config: recordingConfig,
     outputPath: nil
   )
 
-  // Wait for the specified duration
-  try await Task.sleep(for: .seconds(durationSeconds))
+  var videoURL: URL?
 
-  // Stop recording
-  let videoURL = try await screenRecorder.stopRecording()
+  // Wait for first frame before starting timer
+  for await event in eventStream {
+    switch event {
+    case .started(let url):
+      videoURL = url
+
+    case .firstFrameCaptured:
+      // NOW start the duration timer - first actual frame captured
+      try await Task.sleep(for: .seconds(durationSeconds))
+      _ = try await screenRecorder.stopRecording()
+
+    case .stopped(let url):
+      videoURL = url
+
+    case .error(let message):
+      throw ToolError.invalidArgument(message)
+    }
+  }
+
+  guard let finalURL = videoURL else {
+    throw ToolError.invalidArgument("Recording failed - no output URL")
+  }
 
   // Determine analysis mode
   let mode = arguments["mode"]?.stringValue ?? "test_animation"
@@ -1105,7 +861,7 @@ func handleRecordSimulatorAndAnalyze(
   )
 
   // Extract and analyze
-  let extractionResult = try await frameExtractor.extractFrames(from: videoURL, config: extractionConfig)
+  let extractionResult = try await frameExtractor.extractFrames(from: finalURL, config: extractionConfig)
   let analysisResult = try await videoAnalyzer.analyze(
     extractionResult: extractionResult,
     config: analysisConfig
@@ -1113,7 +869,198 @@ func handleRecordSimulatorAndAnalyze(
 
   return """
     iOS Simulator recording completed and analyzed.
-    Video file: \(videoURL.path)
+    Video file: \(finalURL.path)
+    Duration: \(durationSeconds) seconds
+    Analysis mode: \(mode)
+
+    \(formatAnalysisResult(extraction: extractionResult, analysis: analysisResult))
+    """
+}
+
+func handleRecordAppAndAnalyze(
+  arguments: [String: Value],
+  frameExtractor: VideoFrameExtractor,
+  videoAnalyzer: VideoAnalyzer,
+  screenRecorder: ScreenRecorder
+) async throws -> String {
+  guard let appName = arguments["app_name"]?.stringValue else {
+    throw ToolError.missingArgument("app_name")
+  }
+
+  guard let durationSeconds = arguments["duration_seconds"]?.intValue else {
+    throw ToolError.missingArgument("duration_seconds")
+  }
+
+  // Configure recording for app window (60fps for animations)
+  let recordingConfig = ScreenRecorder.RecordingConfig(
+    width: 0,  // Will be determined by window size
+    height: 0,
+    fps: 60,
+    showsCursor: true,
+    capturesAudio: false,
+    quality: .high
+  )
+
+  // Start recording with event stream for precise duration synchronization
+  let eventStream = try await screenRecorder.startRecordingWithEvents(
+    appName: appName,
+    config: recordingConfig,
+    outputPath: nil
+  )
+
+  var videoURL: URL?
+
+  // Wait for first frame before starting timer
+  for await event in eventStream {
+    switch event {
+    case .started(let url):
+      videoURL = url
+
+    case .firstFrameCaptured:
+      // NOW start the duration timer - first actual frame captured
+      try await Task.sleep(for: .seconds(durationSeconds))
+      _ = try await screenRecorder.stopRecording()
+
+    case .stopped(let url):
+      videoURL = url
+
+    case .error(let message):
+      throw ToolError.invalidArgument(message)
+    }
+  }
+
+  guard let finalURL = videoURL else {
+    throw ToolError.invalidArgument("Recording failed - no output URL for '\(appName)'")
+  }
+
+  // Determine analysis mode
+  let mode = arguments["mode"]?.stringValue ?? "explain"
+
+  var analysisConfig: VideoAnalyzer.AnalysisConfig
+  var framesPerSecond: Double
+  var maxFrames: Int
+  var targetWidth: Int
+  var compressionQuality: Double
+
+  switch mode {
+  case "test_animation":
+    analysisConfig = VideoAnalyzer.AnalysisConfig(
+      batchSize: 10,
+      model: "gpt-4o-mini",
+      maxTokensPerBatch: 2000,
+      systemPrompt: """
+        You are a QA engineer testing UI animations in '\(appName)'. Analyze these sequential frames and report:
+        1. TIMING: Estimate the easing curve (ease-in, ease-out, ease-in-out, linear, spring/bounce)
+        2. SMOOTHNESS: Any dropped frames, stutters, or jerky motion?
+        3. CONSISTENCY: Does the animation maintain consistent speed/acceleration?
+        4. START/END STATES: Are initial and final positions correct?
+        5. ISSUES: Any visual glitches, clipping, z-index problems, or artifacts?
+        Be precise with frame numbers and timestamps when reporting issues.
+        """,
+      imageDetail: "high",
+      temperature: 0.1
+    )
+    framesPerSecond = 60.0
+    maxFrames = min(durationSeconds * 60, 180)
+    targetWidth = 1024
+    compressionQuality = 0.75
+
+  case "find_bugs":
+    analysisConfig = VideoAnalyzer.AnalysisConfig(
+      batchSize: 5,
+      model: "gpt-4o-mini",
+      maxTokensPerBatch: 1500,
+      systemPrompt: """
+        You are a QA engineer testing '\(appName)'. Look for bugs and issues:
+        1. VISUAL BUGS: Glitches, artifacts, incorrect rendering, clipping issues
+        2. UI ISSUES: Misaligned elements, overlapping content, broken layouts
+        3. TEXT PROBLEMS: Truncation, overflow, incorrect formatting
+        4. STATE ERRORS: Wrong colors, missing elements, incorrect data
+        5. ANIMATION ISSUES: Stutters, jumps, incomplete transitions
+        Report each issue with the frame number/timestamp and specific location.
+        """,
+      imageDetail: "high",
+      temperature: 0.1
+    )
+    framesPerSecond = 2.0
+    maxFrames = min(durationSeconds * 2, 60)
+    targetWidth = 1920
+    compressionQuality = 0.9
+
+  case "accessibility":
+    analysisConfig = VideoAnalyzer.AnalysisConfig(
+      batchSize: 5,
+      model: "gpt-4o-mini",
+      maxTokensPerBatch: 1500,
+      systemPrompt: """
+        Evaluate this '\(appName)' UI for accessibility concerns:
+        1. TEXT: Is text readable? Appropriate size? Sufficient contrast?
+        2. COLORS: Are there contrast issues? Color-only indicators?
+        3. TOUCH TARGETS: Are interactive elements large enough?
+        4. LABELS: Are UI elements clearly labeled?
+        5. HIERARCHY: Is the visual hierarchy clear?
+        6. MOTION: Any animations that could cause issues for motion-sensitive users?
+        Provide specific recommendations for improvements.
+        """,
+      imageDetail: "high",
+      temperature: 0.2
+    )
+    framesPerSecond = 1.0
+    maxFrames = min(durationSeconds, 30)
+    targetWidth = 1920
+    compressionQuality = 0.9
+
+  default:  // "explain" or unknown
+    analysisConfig = VideoAnalyzer.AnalysisConfig(
+      batchSize: 5,
+      model: "gpt-4o-mini",
+      maxTokensPerBatch: 1500,
+      systemPrompt: """
+        Explain what happens in this '\(appName)' recording. Describe:
+        1. The overall content and context of the application
+        2. Step-by-step user interactions and responses
+        3. Screen transitions and navigation flow
+        4. Important UI elements and their states
+        Be thorough and descriptive.
+        """,
+      imageDetail: "auto",
+      temperature: 0.3
+    )
+    framesPerSecond = 1.0
+    maxFrames = 30
+    targetWidth = 1024
+    compressionQuality = 0.8
+  }
+
+  // Apply custom prompt if provided
+  if let customPrompt = arguments["custom_prompt"]?.stringValue {
+    analysisConfig = VideoAnalyzer.AnalysisConfig(
+      batchSize: analysisConfig.batchSize,
+      model: analysisConfig.model,
+      maxTokensPerBatch: analysisConfig.maxTokensPerBatch,
+      systemPrompt: customPrompt,
+      imageDetail: analysisConfig.imageDetail,
+      temperature: analysisConfig.temperature
+    )
+  }
+
+  let extractionConfig = VideoFrameExtractor.ExtractionConfig(
+    framesPerSecond: framesPerSecond,
+    maxFrames: maxFrames,
+    targetWidth: targetWidth,
+    compressionQuality: compressionQuality
+  )
+
+  // Extract and analyze
+  let extractionResult = try await frameExtractor.extractFrames(from: finalURL, config: extractionConfig)
+  let analysisResult = try await videoAnalyzer.analyze(
+    extractionResult: extractionResult,
+    config: analysisConfig
+  )
+
+  return """
+    '\(appName)' recording completed and analyzed.
+    Video file: \(finalURL.path)
     Duration: \(durationSeconds) seconds
     Analysis mode: \(mode)
 
@@ -1194,160 +1141,16 @@ func launchRegionSelector() async throws -> SelectionResult {
   return result
 }
 
-func handleSelectScreenRegion() async throws -> String {
-  let result = try await launchRegionSelector()
-
-  if result.cancelled {
-    return """
-      Selection cancelled by user.
-      No region was selected.
-      """
-  }
-
-  return """
-    Region selected successfully!
-
-    Coordinates:
-    - X: \(result.x)
-    - Y: \(result.y)
-    - Width: \(result.width)
-    - Height: \(result.height)
-
-    Screen size: \(result.screenWidth) x \(result.screenHeight)
-
-    You can now use 'record_region' with these coordinates to start recording.
-    """
-}
-
-func handleRecordRegion(
-  arguments: [String: Value],
-  screenRecorder: ScreenRecorder
-) async throws -> String {
-  guard let x = arguments["x"]?.intValue,
-        let y = arguments["y"]?.intValue,
-        let width = arguments["width"]?.intValue,
-        let height = arguments["height"]?.intValue else {
-    throw ToolError.missingArgument("x, y, width, and height are required")
-  }
-
-  var fps = 30
-  if let f = arguments["fps"]?.intValue {
-    fps = f
-  }
-
-  var outputPath: String?
-  if let path = arguments["output_path"]?.stringValue {
-    outputPath = path
-  }
-
-  let region = CGRect(x: x, y: y, width: width, height: height)
-
-  let config = ScreenRecorder.RecordingConfig(
-    width: width,
-    height: height,
-    fps: fps,
-    showsCursor: true,
-    capturesAudio: false,
-    quality: .high
-  )
-
-  let url = try await screenRecorder.startRecording(
-    region: region,
-    config: config,
-    outputPath: outputPath
-  )
-
-  return """
-    Started recording screen region.
-    Region: \(x), \(y) - \(width)x\(height)
-    Output file: \(url.path)
-    FPS: \(fps)
-
-    Use 'stop_screen_recording' to stop and save the recording.
-    """
-}
-
-func handleSelectAndRecordRegion(
-  arguments: [String: Value],
-  screenRecorder: ScreenRecorder
-) async throws -> String {
-  // First, launch the visual selector
-  let selection = try await launchRegionSelector()
-
-  if selection.cancelled {
-    return """
-      Selection cancelled by user.
-      No recording started.
-      """
-  }
-
-  var fps = 60
-  if let f = arguments["fps"]?.intValue {
-    fps = f
-  }
-
-  let region = CGRect(
-    x: selection.x,
-    y: selection.y,
-    width: selection.width,
-    height: selection.height
-  )
-
-  let config = ScreenRecorder.RecordingConfig(
-    width: selection.width,
-    height: selection.height,
-    fps: fps,
-    showsCursor: true,
-    capturesAudio: false,
-    quality: .high
-  )
-
-  let url = try await screenRecorder.startRecording(
-    region: region,
-    config: config,
-    outputPath: nil
-  )
-
-  // Handle optional auto-stop duration
-  if let durationSeconds = arguments["duration_seconds"]?.intValue {
-    Task {
-      try await Task.sleep(for: .seconds(durationSeconds))
-      _ = try? await screenRecorder.stopRecording()
-    }
-
-    return """
-      Region selected and recording started!
-
-      Selected region: \(selection.x), \(selection.y) - \(selection.width)x\(selection.height)
-      Output file: \(url.path)
-      FPS: \(fps)
-      Auto-stop: \(durationSeconds) seconds
-
-      Recording will automatically stop after \(durationSeconds) seconds,
-      or use 'stop_screen_recording' to stop early.
-      """
-  }
-
-  return """
-    Region selected and recording started!
-
-    Selected region: \(selection.x), \(selection.y) - \(selection.width)x\(selection.height)
-    Output file: \(url.path)
-    FPS: \(fps)
-
-    Use 'stop_screen_recording' to stop and save the recording.
-    """
-}
-
 func handleSelectRecordAndAnalyze(
   arguments: [String: Value],
   frameExtractor: VideoFrameExtractor,
   videoAnalyzer: VideoAnalyzer,
   screenRecorder: ScreenRecorder
 ) async throws -> String {
-  guard let durationSeconds = arguments["duration_seconds"]?.intValue else {
-    throw ToolError.missingArgument("duration_seconds")
-  }
+  // duration_seconds is now optional
+  // - If provided: timed mode with countdown
+  // - If nil: manual mode with count-up (30s max)
+  let durationSeconds = arguments["duration_seconds"]?.intValue
 
   // First, launch the visual selector
   let selection = try await launchRegionSelector()
@@ -1376,21 +1179,98 @@ func handleSelectRecordAndAnalyze(
     quality: .high
   )
 
-  // Start recording
-  _ = try await screenRecorder.startRecording(
+  // Launch recording status UI
+  let statusUI = await MainActor.run { RecordingStatusUI() }
+
+  // Try to launch UI (continue without it if it fails)
+  // Pass durationSeconds (nil for manual mode = count-up timer)
+  let uiEvents: AsyncStream<RecordingStatusUI.UIEvent>?
+  do {
+    uiEvents = try await statusUI.launch(config: .init(durationSeconds: durationSeconds))
+  } catch {
+    FileHandle.standardError.write("Warning: Could not launch recording status UI: \(error)\n".data(using: .utf8)!)
+    uiEvents = nil
+  }
+
+  // Start recording with event stream for precise duration synchronization
+  let eventStream = try await screenRecorder.startRecordingWithEvents(
     region: region,
     config: recordingConfig,
     outputPath: nil
   )
 
-  // Wait for the specified duration
-  try await Task.sleep(for: .seconds(durationSeconds))
+  var videoURL: URL?
 
-  // Stop recording
-  let videoURL = try await screenRecorder.stopRecording()
+  // Wait for first frame before starting timer
+  for await event in eventStream {
+    switch event {
+    case .started(let url):
+      videoURL = url
+
+    case .firstFrameCaptured:
+      // Notify UI that recording has started
+      await statusUI.notifyRecordingStarted()
+
+      // Race between duration timer (if timed mode) and UI stop events
+      if let uiEvents = uiEvents {
+        await withTaskGroup(of: Void.self) { group in
+          // Timer task (only if duration specified - timed mode)
+          if let duration = durationSeconds {
+            group.addTask {
+              try? await Task.sleep(for: .seconds(duration))
+              _ = try? await screenRecorder.stopRecording()
+            }
+          }
+
+          // UI events task (handles Stop button and timeout for manual mode)
+          group.addTask {
+            for await event in uiEvents {
+              switch event {
+              case .stopClicked, .timeout:
+                _ = try? await screenRecorder.stopRecording()
+                return
+              case .ready, .processExited:
+                break
+              }
+            }
+          }
+
+          // Wait for first task to complete
+          await group.next()
+          group.cancelAll()
+        }
+      } else {
+        // No UI available - use duration if provided, otherwise default to 5 seconds
+        let fallbackDuration = durationSeconds ?? 5
+        try await Task.sleep(for: .seconds(fallbackDuration))
+        _ = try await screenRecorder.stopRecording()
+      }
+
+    case .stopped(let url):
+      videoURL = url
+      // Notify UI to show analyzing state
+      await statusUI.notifyAnalyzing()
+
+    case .error(let message):
+      await statusUI.notifyError()
+      try? await Task.sleep(for: .seconds(1.5))
+      await MainActor.run { statusUI.terminate() }
+      throw ToolError.invalidArgument(message)
+    }
+  }
+
+  guard let finalURL = videoURL else {
+    await statusUI.notifyError()
+    try? await Task.sleep(for: .seconds(1.5))
+    await MainActor.run { statusUI.terminate() }
+    throw ToolError.invalidArgument("Recording failed - no output URL")
+  }
 
   // Determine analysis mode
   let mode = arguments["mode"]?.stringValue ?? "explain"
+
+  // For frame extraction, use actual duration or default to 30 (max for manual mode)
+  let effectiveDurationForFrames = durationSeconds ?? 30
 
   var analysisConfig: VideoAnalyzer.AnalysisConfig
   var framesPerSecond: Double
@@ -1417,7 +1297,7 @@ func handleSelectRecordAndAnalyze(
       temperature: 0.1
     )
     framesPerSecond = 60.0
-    maxFrames = min(durationSeconds * 60, 180)
+    maxFrames = min(effectiveDurationForFrames * 60, 180)
     targetWidth = 1024
     compressionQuality = 0.75
 
@@ -1439,7 +1319,7 @@ func handleSelectRecordAndAnalyze(
       temperature: 0.1
     )
     framesPerSecond = 2.0
-    maxFrames = min(durationSeconds * 2, 60)
+    maxFrames = min(effectiveDurationForFrames * 2, 60)
     targetWidth = 1920
     compressionQuality = 0.9
 
@@ -1462,7 +1342,7 @@ func handleSelectRecordAndAnalyze(
       temperature: 0.2
     )
     framesPerSecond = 1.0
-    maxFrames = min(durationSeconds, 30)
+    maxFrames = min(effectiveDurationForFrames, 30)
     targetWidth = 1920
     compressionQuality = 0.9
 
@@ -1508,22 +1388,37 @@ func handleSelectRecordAndAnalyze(
   )
 
   // Extract and analyze
-  let extractionResult = try await frameExtractor.extractFrames(from: videoURL, config: extractionConfig)
-  let analysisResult = try await videoAnalyzer.analyze(
-    extractionResult: extractionResult,
-    config: analysisConfig
-  )
+  do {
+    let extractionResult = try await frameExtractor.extractFrames(from: finalURL, config: extractionConfig)
+    let analysisResult = try await videoAnalyzer.analyze(
+      extractionResult: extractionResult,
+      config: analysisConfig
+    )
 
-  return """
-    Screen region recording completed and analyzed!
+    // Show success state briefly before closing UI
+    await statusUI.notifySuccess()
+    try? await Task.sleep(for: .seconds(1.5))
+    await statusUI.notifyRecordingStopped()
 
-    Selected region: \(selection.x), \(selection.y) - \(selection.width)x\(selection.height)
-    Video file: \(videoURL.path)
-    Duration: \(durationSeconds) seconds
-    Analysis mode: \(mode)
+    let durationText = durationSeconds.map { "\($0) seconds" } ?? "manual (user stopped)"
 
-    \(formatAnalysisResult(extraction: extractionResult, analysis: analysisResult))
-    """
+    return """
+      Screen region recording completed and analyzed!
+
+      Selected region: \(selection.x), \(selection.y) - \(selection.width)x\(selection.height)
+      Video file: \(finalURL.path)
+      Duration: \(durationText)
+      Analysis mode: \(mode)
+
+      \(formatAnalysisResult(extraction: extractionResult, analysis: analysisResult))
+      """
+  } catch {
+    // Show error state briefly before closing UI
+    await statusUI.notifyError()
+    try? await Task.sleep(for: .seconds(1.5))
+    await statusUI.notifyRecordingStopped()
+    throw error
+  }
 }
 
 // MARK: - Helper Functions
