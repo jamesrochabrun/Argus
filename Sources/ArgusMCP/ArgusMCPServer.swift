@@ -61,6 +61,11 @@ final class RecordingSession {
   }
 }
 
+// MARK: - Model Configuration
+
+/// Default model for video analysis - change this to swap models globally
+public let defaultVisionModel = "gpt-5-nano"
+
 // MARK: - Analysis Mode Configuration
 
 /// Analysis quality modes with their associated configurations
@@ -82,7 +87,7 @@ enum AnalysisMode: String {
       return (
         analysis: VideoAnalyzer.AnalysisConfig(
           batchSize: 8,
-          model: "gpt-4o-mini",
+          model: defaultVisionModel,
           maxTokensPerBatch: 500,
           systemPrompt: "Provide a quick, concise summary of what happens in this \(context). Focus on the main content and key moments.",
           imageDetail: "low",
@@ -100,7 +105,7 @@ enum AnalysisMode: String {
       return (
         analysis: VideoAnalyzer.AnalysisConfig(
           batchSize: 5,
-          model: "gpt-4o-mini",
+          model: defaultVisionModel,
           maxTokensPerBatch: 1500,
           systemPrompt: """
             Explain in detail what happens in this \(context). Describe:
@@ -125,7 +130,7 @@ enum AnalysisMode: String {
       return (
         analysis: VideoAnalyzer.AnalysisConfig(
           batchSize: 5,
-          model: "gpt-4o-mini",
+          model: defaultVisionModel,
           maxTokensPerBatch: 2000,
           systemPrompt: """
             You are a QA engineer performing comprehensive analysis of this \(context). Examine each frame carefully and report on:
@@ -424,74 +429,6 @@ struct ArgusMCPServer: AsyncParsableCommand {
       ),
 
       MCPTool(
-        name: "record_simulator_and_analyze",
-        description: """
-          Record the iOS Simulator for a specified duration and automatically analyze
-          the animation/UI. Perfect for QA testing animations and transitions.
-          """,
-        inputSchema: .object([
-          "type": "object",
-          "properties": .object([
-            "duration_seconds": .object([
-              "type": "integer",
-              "description": "Duration to record in seconds. If not provided, recording runs until user clicks Stop (max 30s)."
-            ]),
-            "mode": .object([
-              "type": "string",
-              "description": """
-                Analysis quality level:
-                - 'low': Fast overview (~$0.001) - Quick summary
-                - 'medium': Balanced detail (~$0.003) - Good for most tasks
-                - 'high': Comprehensive analysis (~$0.05+, ⚠️ higher cost) - Frame-by-frame, catches animations/bugs/accessibility
-                """,
-              "enum": .array(["low", "medium", "high"])
-            ]),
-            "custom_prompt": .object([
-              "type": "string",
-              "description": "Optional custom analysis prompt"
-            ])
-          ]),
-          "required": .array(["mode"])
-        ])
-      ),
-
-      MCPTool(
-        name: "record_app_and_analyze",
-        description: """
-          Record a specific application window by name and automatically analyze it with AI.
-          Perfect for testing UI, animations, and interactions in any app (Safari, Chrome, etc.).
-          """,
-        inputSchema: .object([
-          "type": "object",
-          "properties": .object([
-            "app_name": .object([
-              "type": "string",
-              "description": "Name of the application to record (e.g., 'Safari', 'Chrome', 'Finder')"
-            ]),
-            "duration_seconds": .object([
-              "type": "integer",
-              "description": "Duration to record in seconds. If not provided, recording runs until user clicks Stop (max 30s)."
-            ]),
-            "mode": .object([
-              "type": "string",
-              "description": """
-                Analysis quality level:
-                - 'low': Fast overview (~$0.001) - Quick summary
-                - 'medium': Balanced detail (~$0.003) - Good for most tasks
-                - 'high': Comprehensive analysis (~$0.05+, ⚠️ higher cost) - Frame-by-frame, catches animations/bugs/accessibility
-                """,
-              "enum": .array(["low", "medium", "high"])
-            ]),
-            "custom_prompt": .object([
-              "type": "string",
-              "description": "Optional custom analysis prompt"
-            ])
-          ]),
-          "required": .array(["app_name", "mode"])
-        ])
-      ),
-
-      MCPTool(
         name: "select_record_and_analyze",
         description: """
           Opens a visual crosshair overlay to select a specific screen region, then records
@@ -660,7 +597,7 @@ func handleAnalyzeVideo(
       // Fast overview - quick summary
       analysisConfig = VideoAnalyzer.AnalysisConfig(
         batchSize: 8,
-        model: "gpt-4o-mini",
+        model: defaultVisionModel,
         maxTokensPerBatch: 500,
         systemPrompt: "Provide a quick, concise summary of what happens in this video. Focus on the main content and key moments.",
         imageDetail: "low",
@@ -675,7 +612,7 @@ func handleAnalyzeVideo(
       // Balanced analysis - good for most tasks
       analysisConfig = VideoAnalyzer.AnalysisConfig(
         batchSize: 5,
-        model: "gpt-4o-mini",
+        model: defaultVisionModel,
         maxTokensPerBatch: 1500,
         systemPrompt: """
           Explain in detail what happens in this video. Describe:
@@ -697,7 +634,7 @@ func handleAnalyzeVideo(
       // Comprehensive frame-by-frame analysis
       analysisConfig = VideoAnalyzer.AnalysisConfig(
         batchSize: 5,
-        model: "gpt-4o-mini",
+        model: defaultVisionModel,
         maxTokensPerBatch: 2000,
         systemPrompt: """
           You are a QA engineer performing comprehensive video analysis. Examine each frame carefully and report on:
