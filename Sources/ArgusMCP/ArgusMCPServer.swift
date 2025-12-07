@@ -71,7 +71,7 @@ public let defaultVisionModel = "gpt-5-nano"
 /// Analysis quality modes with their associated configurations
 enum AnalysisMode: String {
   case low
-  case medium
+  case auto
   case high
 
   /// Returns analysis and extraction configs for the given mode
@@ -101,7 +101,7 @@ enum AnalysisMode: String {
         )
       )
 
-    case .medium:
+    case .auto:
       return (
         analysis: VideoAnalyzer.AnalysisConfig(
           batchSize: 5,
@@ -381,10 +381,10 @@ struct ArgusMCPServer: AsyncParsableCommand {
               "description": """
                 Analysis quality level:
                 - 'low': Fast overview (~$0.001) - Quick summary, 15 frames at 0.5fps
-                - 'medium': Balanced detail (~$0.003) - Good for most tasks, 30 frames at 1fps
+                - 'auto': Balanced detail (~$0.003) - Good for most tasks, 30 frames at 1fps
                 - 'high': Comprehensive analysis (~$0.05+, ⚠️ higher cost) - Frame-by-frame analysis at 30fps, catches animations, bugs, and accessibility issues
                 """,
-              "enum": .array(["low", "medium", "high"])
+              "enum": .array(["low", "auto", "high"])
             ]),
             "custom_prompt": .object([
               "type": "string",
@@ -414,10 +414,10 @@ struct ArgusMCPServer: AsyncParsableCommand {
               "description": """
                 Analysis quality level:
                 - 'low': Fast overview (~$0.001) - Quick summary
-                - 'medium': Balanced detail (~$0.003) - Good for most tasks
+                - 'auto': Balanced detail (~$0.003) - Good for most tasks
                 - 'high': Comprehensive analysis (~$0.05+, ⚠️ higher cost) - Frame-by-frame, catches animations/bugs/accessibility
                 """,
-              "enum": .array(["low", "medium", "high"])
+              "enum": .array(["low", "auto", "high"])
             ]),
             "custom_prompt": .object([
               "type": "string",
@@ -447,10 +447,10 @@ struct ArgusMCPServer: AsyncParsableCommand {
               "description": """
                 Analysis quality level:
                 - 'low': Fast overview (~$0.001) - Quick summary
-                - 'medium': Balanced detail (~$0.003) - Good for most tasks
+                - 'auto': Balanced detail (~$0.003) - Good for most tasks
                 - 'high': Comprehensive analysis (~$0.05+, ⚠️ higher cost) - Frame-by-frame, catches animations/bugs/accessibility
                 """,
-              "enum": .array(["low", "medium", "high"])
+              "enum": .array(["low", "auto", "high"])
             ]),
             "custom_prompt": .object([
               "type": "string",
@@ -608,7 +608,7 @@ func handleAnalyzeVideo(
       targetWidth = 512
       compressionQuality = 0.7
 
-    case "medium":
+    case "auto":
       // Balanced analysis - good for most tasks
       analysisConfig = VideoAnalyzer.AnalysisConfig(
         batchSize: 5,
@@ -714,7 +714,7 @@ func handleRecordAndAnalyze(
 ) async throws -> String {
   // Duration is optional: nil = manual mode, Int = timed mode (capped at 30s)
   let durationSeconds = arguments["duration_seconds"]?.intValue
-  let mode = AnalysisMode(rawValue: arguments["mode"]?.stringValue ?? "medium") ?? .medium
+  let mode = AnalysisMode(rawValue: arguments["mode"]?.stringValue ?? "auto") ?? .auto
   let effectiveDuration = durationSeconds.map { min($0, RecordingOrchestrator.maxDuration) } ?? RecordingOrchestrator.maxDuration
 
   // Start recording
@@ -778,7 +778,7 @@ func handleRecordSimulatorAndAnalyze(
 ) async throws -> String {
   // Duration is optional: nil = manual mode, Int = timed mode (capped at 30s)
   let durationSeconds = arguments["duration_seconds"]?.intValue
-  let mode = AnalysisMode(rawValue: arguments["mode"]?.stringValue ?? "medium") ?? .medium
+  let mode = AnalysisMode(rawValue: arguments["mode"]?.stringValue ?? "auto") ?? .auto
   let effectiveDuration = durationSeconds.map { min($0, RecordingOrchestrator.maxDuration) } ?? RecordingOrchestrator.maxDuration
 
   // Configure recording for simulator (60fps for animations)
@@ -859,7 +859,7 @@ func handleRecordAppAndAnalyze(
 
   // Duration is optional: nil = manual mode, Int = timed mode (capped at 30s)
   let durationSeconds = arguments["duration_seconds"]?.intValue
-  let mode = AnalysisMode(rawValue: arguments["mode"]?.stringValue ?? "medium") ?? .medium
+  let mode = AnalysisMode(rawValue: arguments["mode"]?.stringValue ?? "auto") ?? .auto
   let effectiveDuration = durationSeconds.map { min($0, RecordingOrchestrator.maxDuration) } ?? RecordingOrchestrator.maxDuration
 
   // Configure recording for app window (60fps for animations)
@@ -1009,7 +1009,7 @@ func handleSelectRecordAndAnalyze(
 ) async throws -> String {
   // Duration is optional: nil = manual mode, Int = timed mode (capped at 30s)
   let durationSeconds = arguments["duration_seconds"]?.intValue
-  let mode = AnalysisMode(rawValue: arguments["mode"]?.stringValue ?? "medium") ?? .medium
+  let mode = AnalysisMode(rawValue: arguments["mode"]?.stringValue ?? "auto") ?? .auto
   let effectiveDuration = durationSeconds.map { min($0, RecordingOrchestrator.maxDuration) } ?? RecordingOrchestrator.maxDuration
 
   // First, launch the visual selector
