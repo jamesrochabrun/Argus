@@ -64,7 +64,7 @@ final class RecordingSession {
 // MARK: - Model Configuration
 
 /// Default model for video analysis - change this to swap models globally
-public let defaultVisionModel = "gpt-5-nano"
+public let defaultVisionModel = "gpt-4o-mini"
 
 // MARK: - Analysis Mode Configuration
 
