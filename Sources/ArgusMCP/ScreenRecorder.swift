@@ -4,10 +4,8 @@ import ScreenCaptureKit
 
 /// Screen recorder using ScreenCaptureKit for macOS
 /// Captures screen content and saves to video file
-/// NOTE: ScreenCaptureKit requires window server connection, so this must run on MainActor
 @available(macOS 14.0, *)
-@MainActor
-public final class ScreenRecorder {
+public actor ScreenRecorder {
 
   /// Recording configuration
   public struct RecordingConfig: Sendable {
@@ -103,23 +101,20 @@ public final class ScreenRecorder {
   public init() {}
 
   /// Get available displays
-
   public func getAvailableDisplays() async throws -> [DisplayInfo] {
     let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-    let mainDisplayID = CGMainDisplayID()
 
     return content.displays.map { display in
       DisplayInfo(
         displayID: display.displayID,
         width: display.width,
         height: display.height,
-        isMain: display.displayID == mainDisplayID
+        isMain: display.displayID == CGMainDisplayID()
       )
     }
   }
 
   /// Get available windows
-
   public func getAvailableWindows() async throws -> [WindowInfo] {
     let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
 
@@ -139,7 +134,6 @@ public final class ScreenRecorder {
   }
 
   /// Start recording the main display
-
   public func startRecording(
     config: RecordingConfig = .default,
     outputPath: String? = nil
@@ -152,8 +146,7 @@ public final class ScreenRecorder {
 
     // Get the main display
     let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-    let mainDisplayID = CGMainDisplayID()
-    guard let mainDisplay = content.displays.first(where: { $0.displayID == mainDisplayID }) ?? content.displays.first else {
+    guard let mainDisplay = content.displays.first(where: { $0.displayID == CGMainDisplayID() }) ?? content.displays.first else {
       throw RecorderError.noDisplayAvailable
     }
 
@@ -161,7 +154,6 @@ public final class ScreenRecorder {
   }
 
   /// Start recording a specific display
-
   public func startRecording(
     displayID: CGDirectDisplayID,
     config: RecordingConfig = .default,
@@ -182,7 +174,6 @@ public final class ScreenRecorder {
   }
 
   /// Start recording a specific window
-
   public func startRecording(
     windowID: CGWindowID,
     config: RecordingConfig = .default,
@@ -203,7 +194,6 @@ public final class ScreenRecorder {
   }
 
   /// Start recording a window by app name (e.g., "Simulator", "Safari")
-
   public func startRecording(
     appName: String,
     config: RecordingConfig = .default,
@@ -234,7 +224,6 @@ public final class ScreenRecorder {
   }
 
   /// Start recording a specific region of the screen
-
   public func startRecording(
     region: CGRect,
     config: RecordingConfig = .default,
@@ -247,8 +236,7 @@ public final class ScreenRecorder {
     state = .preparing
 
     let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-    let mainDisplayID = CGMainDisplayID()
-    guard let mainDisplay = content.displays.first(where: { $0.displayID == mainDisplayID }) ?? content.displays.first else {
+    guard let mainDisplay = content.displays.first(where: { $0.displayID == CGMainDisplayID() }) ?? content.displays.first else {
       throw RecorderError.noDisplayAvailable
     }
 
@@ -383,7 +371,6 @@ public final class ScreenRecorder {
   }
 
   /// Find the iOS Simulator window
-
   public func findSimulatorWindow() async throws -> WindowInfo {
     let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
 
@@ -408,7 +395,6 @@ public final class ScreenRecorder {
     )
   }
 
-
   private func startRecording(
     display: SCDisplay,
     config: RecordingConfig,
@@ -419,7 +405,6 @@ public final class ScreenRecorder {
 
     return try await setupAndStartRecording(filter: filter, config: config, outputPath: outputPath, cropRect: nil)
   }
-
 
   private func startRecording(
     window: SCWindow,
@@ -446,7 +431,6 @@ public final class ScreenRecorder {
 
     return try await setupAndStartRecording(filter: filter, config: effectiveConfig, outputPath: outputPath, cropRect: nil)
   }
-
 
   private func setupAndStartRecording(
     filter: SCContentFilter,
@@ -615,11 +599,12 @@ public final class ScreenRecorder {
       videoInput: videoInput!,
       adaptor: pixelBufferAdaptor!,
       onFirstFrame: { [weak self] in
-        // This runs on the DispatchQueue, use MainActor to safely check state
-        Task { @MainActor [weak self] in
+        // This runs on the DispatchQueue, hop to the actor's context
+        Task {
           guard let self = self else { return }
           // Only yield if we're still recording
-          if case .recording = self.state {
+          let currentState = await self.getState()
+          if case .recording = currentState {
             capturedContinuation.yield(.firstFrameCaptured)
           }
         }
@@ -651,6 +636,9 @@ public final class ScreenRecorder {
     }
 
     state = .stopping
+
+    // Stop accepting frames immediately to prevent late frames
+    streamOutput?.stopWriting()
 
     // Stop the stream
     try await stream?.stopCapture()
@@ -746,6 +734,10 @@ private class StreamOutput: NSObject, SCStreamOutput {
   private var hasNotifiedFirstFrame = false
   private let notificationLock = NSLock()
 
+  // Stop flag to prevent writing frames after stop is requested
+  private var isStopped = false
+  private let stoppedLock = NSLock()
+
   init(
     assetWriter: AVAssetWriter,
     videoInput: AVAssetWriterInput,
@@ -759,8 +751,22 @@ private class StreamOutput: NSObject, SCStreamOutput {
     super.init()
   }
 
+  /// Signal that recording should stop - no more frames will be written
+  func stopWriting() {
+    stoppedLock.lock()
+    isStopped = true
+    stoppedLock.unlock()
+  }
+
   func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
     guard type == .screen else { return }
+
+    // Check if stopped (thread-safe)
+    stoppedLock.lock()
+    let stopped = isStopped
+    stoppedLock.unlock()
+    guard !stopped else { return }
+
     guard assetWriter.status == .writing else { return }
     guard videoInput.isReadyForMoreMediaData else { return }
 

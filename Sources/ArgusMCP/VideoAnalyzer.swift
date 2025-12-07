@@ -22,7 +22,7 @@ public final class VideoAnalyzer: @unchecked Sendable {
 
     public init(
       batchSize: Int = 5,
-      model: String = "gpt-4o-mini",
+      model: String = defaultVisionModel,
       maxTokensPerBatch: Int = 1000,
       systemPrompt: String = Self.defaultSystemPrompt,
       imageDetail: String = "auto",

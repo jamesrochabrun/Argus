@@ -1,4 +1,3 @@
-import AppKit
 import ArgumentParser
 import Foundation
 import MCP
@@ -62,6 +61,278 @@ final class RecordingSession {
   }
 }
 
+// MARK: - Model Configuration
+
+/// Default model for video analysis - change this to swap models globally
+public let defaultVisionModel = "gpt-5-nano"
+
+// MARK: - Analysis Mode Configuration
+
+/// Analysis quality modes with their associated configurations
+enum AnalysisMode: String {
+  case low
+  case auto
+  case high
+
+  /// Returns analysis and extraction configs for the given mode
+  /// - Parameters:
+  ///   - context: Description like "screen recording", "iOS Simulator", etc.
+  ///   - effectiveDuration: Used to calculate maxFrames for high mode
+  func configs(context: String, effectiveDuration: Int) -> (
+    analysis: VideoAnalyzer.AnalysisConfig,
+    extraction: VideoFrameExtractor.ExtractionConfig
+  ) {
+    switch self {
+    case .low:
+      return (
+        analysis: VideoAnalyzer.AnalysisConfig(
+          batchSize: 8,
+          model: defaultVisionModel,
+          maxTokensPerBatch: 500,
+          systemPrompt: "Provide a quick, concise summary of what happens in this \(context). Focus on the main content and key moments.",
+          imageDetail: "low",
+          temperature: 0.3
+        ),
+        extraction: VideoFrameExtractor.ExtractionConfig(
+          framesPerSecond: 0.5,
+          maxFrames: 15,
+          targetWidth: 512,
+          compressionQuality: 0.7
+        )
+      )
+
+    case .auto:
+      return (
+        analysis: VideoAnalyzer.AnalysisConfig(
+          batchSize: 5,
+          model: defaultVisionModel,
+          maxTokensPerBatch: 1500,
+          systemPrompt: """
+            Explain in detail what happens in this \(context). Describe:
+            1. The overall content and context
+            2. Step-by-step actions and events
+            3. Important UI elements, text, and visual information
+            4. The purpose and outcome of what's shown
+            Be thorough and educational in your explanation.
+            """,
+          imageDetail: "auto",
+          temperature: 0.3
+        ),
+        extraction: VideoFrameExtractor.ExtractionConfig(
+          framesPerSecond: 1.0,
+          maxFrames: 30,
+          targetWidth: 1024,
+          compressionQuality: 0.8
+        )
+      )
+
+    case .high:
+      return (
+        analysis: VideoAnalyzer.AnalysisConfig(
+          batchSize: 5,
+          model: defaultVisionModel,
+          maxTokensPerBatch: 2000,
+          systemPrompt: """
+            You are a QA engineer performing comprehensive analysis of this \(context). Examine each frame carefully and report on:
+
+            ## ANIMATIONS
+            - Timing and easing curves (ease-in, ease-out, linear, spring/bounce)
+            - Smoothness - any dropped frames, stutters, or jerky motion?
+            - Start/end states - are initial and final positions correct?
+
+            ## VISUAL BUGS
+            - Glitches, artifacts, incorrect rendering, clipping issues
+            - Misaligned elements, overlapping content, broken layouts
+            - Text truncation, overflow, incorrect formatting
+
+            ## ACCESSIBILITY
+            - Text readability and contrast (WCAG AA compliance)
+            - Touch target sizes (44pt minimum for interactive elements)
+            - Color-only indicators that may be problematic
+            - Visual hierarchy clarity
+
+            ## STATE CONSISTENCY
+            - Wrong colors, missing elements, incorrect data
+            - UI state errors or inconsistencies
+
+            Be precise with frame numbers and timestamps when reporting issues.
+            Provide specific recommendations for any problems found.
+            """,
+          imageDetail: "high",
+          temperature: 0.1
+        ),
+        extraction: VideoFrameExtractor.ExtractionConfig(
+          framesPerSecond: 30.0,
+          maxFrames: min(effectiveDuration * 30, 120),
+          targetWidth: 1920,
+          compressionQuality: 0.9
+        )
+      )
+    }
+  }
+}
+
+// MARK: - Recording Orchestrator
+
+/// Orchestrates screen recording with UI feedback and duration handling
+enum RecordingOrchestrator {
+
+  /// Maximum recording duration in seconds
+  static let maxDuration = 30
+
+  /// Performs a recording session with optional duration
+  /// - Parameters:
+  ///   - eventStream: The recording event stream from ScreenRecorder
+  ///   - durationSeconds: nil = manual mode (user clicks Stop, max 30s), Int = timed mode (capped at 30s)
+  ///   - screenRecorder: The screen recorder instance
+  /// - Returns: Tuple of the recorded video URL and the status UI (for finalization after analysis)
+  static func performRecording(
+    eventStream: AsyncStream<ScreenRecorder.RecordingEvent>,
+    durationSeconds: Int?,
+    screenRecorder: ScreenRecorder
+  ) async throws -> (url: URL, statusUI: RecordingStatusUI?) {
+    // Cap duration at max
+    let effectiveDuration: Int? = durationSeconds.map { min($0, maxDuration) }
+
+    // Launch recording status UI
+    let statusUI = await MainActor.run { RecordingStatusUI() }
+
+    // Try to launch UI (continue without it if it fails)
+    let uiEvents: AsyncStream<RecordingStatusUI.UIEvent>?
+    do {
+      uiEvents = try await statusUI.launch(config: .init(durationSeconds: effectiveDuration))
+    } catch {
+      FileHandle.standardError.write("Warning: Could not launch recording status UI: \(error)\n".data(using: .utf8)!)
+      uiEvents = nil
+    }
+
+    var videoURL: URL?
+
+    // Process recording events
+    for await event in eventStream {
+      switch event {
+      case .started(let url):
+        videoURL = url
+
+      case .firstFrameCaptured:
+        // Notify UI that recording has started
+        await statusUI.notifyRecordingStarted()
+
+        // Race between duration timer (if timed mode) and UI stop events
+        if let uiEvents = uiEvents {
+          await withTaskGroup(of: Void.self) { group in
+            // Timer task (only if duration specified - timed mode)
+            if let duration = effectiveDuration {
+              group.addTask {
+                try? await Task.sleep(for: .seconds(duration))
+                _ = try? await screenRecorder.stopRecording()
+              }
+            }
+
+            // UI events task (handles Stop button and timeout for manual mode)
+            group.addTask {
+              for await event in uiEvents {
+                switch event {
+                case .stopClicked, .timeout:
+                  _ = try? await screenRecorder.stopRecording()
+                  return
+                case .ready, .processExited:
+                  break
+                }
+              }
+            }
+
+            // Wait for first task to complete
+            await group.next()
+            group.cancelAll()
+          }
+        } else {
+          // No UI available
+          if let duration = effectiveDuration {
+            // Timed mode: wait for specified duration
+            try await Task.sleep(for: .seconds(duration))
+            _ = try await screenRecorder.stopRecording()
+          } else {
+            // Manual mode but no UI - use max duration as safety fallback
+            try await Task.sleep(for: .seconds(maxDuration))
+            _ = try await screenRecorder.stopRecording()
+          }
+        }
+
+      case .stopped(let url):
+        videoURL = url
+        // Notify UI to show analyzing state
+        await statusUI.notifyAnalyzing()
+
+      case .error(let message):
+        await statusUI.notifyError()
+        try? await Task.sleep(for: .seconds(1.5))
+        await MainActor.run { statusUI.terminate() }
+        throw ToolError.invalidArgument(message)
+      }
+    }
+
+    guard let finalURL = videoURL else {
+      await statusUI.notifyError()
+      try? await Task.sleep(for: .seconds(1.5))
+      await MainActor.run { statusUI.terminate() }
+      throw ToolError.invalidArgument("Recording failed - no output URL")
+    }
+
+    return (url: finalURL, statusUI: statusUI)
+  }
+
+  /// Completes analysis and shows success/error in UI, then terminates
+  static func finalizeWithUI(
+    success: Bool,
+    statusUI: RecordingStatusUI
+  ) async {
+    if success {
+      await statusUI.notifySuccess()
+    } else {
+      await statusUI.notifyError()
+    }
+    try? await Task.sleep(for: .seconds(1.5))
+    await MainActor.run { statusUI.terminate() }
+  }
+}
+
+// MARK: - Analysis Helper
+
+/// Performs video analysis with the given configuration
+func analyzeVideo(
+  url: URL,
+  mode: AnalysisMode,
+  context: String,
+  customPrompt: String?,
+  effectiveDuration: Int,
+  frameExtractor: VideoFrameExtractor,
+  videoAnalyzer: VideoAnalyzer
+) async throws -> (extraction: VideoFrameExtractor.ExtractionResult, analysis: VideoAnalyzer.VideoAnalysisResult) {
+  var (analysisConfig, extractionConfig) = mode.configs(context: context, effectiveDuration: effectiveDuration)
+
+  // Apply custom prompt if provided
+  if let customPrompt = customPrompt {
+    analysisConfig = VideoAnalyzer.AnalysisConfig(
+      batchSize: analysisConfig.batchSize,
+      model: analysisConfig.model,
+      maxTokensPerBatch: analysisConfig.maxTokensPerBatch,
+      systemPrompt: customPrompt,
+      imageDetail: analysisConfig.imageDetail,
+      temperature: analysisConfig.temperature
+    )
+  }
+
+  // Extract frames and analyze
+  let extractionResult = try await frameExtractor.extractFrames(from: url, config: extractionConfig)
+  let analysisResult = try await videoAnalyzer.analyze(
+    extractionResult: extractionResult,
+    config: analysisConfig
+  )
+
+  return (extraction: extractionResult, analysis: analysisResult)
+}
+
 @main
 struct ArgusMCPServer: AsyncParsableCommand {
   static let configuration = CommandConfiguration(
@@ -71,13 +342,6 @@ struct ArgusMCPServer: AsyncParsableCommand {
   )
 
   mutating func run() async throws {
-    // Initialize NSApplication to establish window server connection
-    // This is required for ScreenCaptureKit to work in a headless context
-    await MainActor.run {
-      _ = NSApplication.shared
-      NSApp.setActivationPolicy(.accessory)  // Run as background app (no dock icon)
-    }
-
     // Get API key from environment
     guard let apiKey = ProcessInfo.processInfo.environment["OPENAI_API_KEY"] else {
       FileHandle.standardError.write("Error: OPENAI_API_KEY environment variable not set\n".data(using: .utf8)!)
@@ -86,7 +350,7 @@ struct ArgusMCPServer: AsyncParsableCommand {
 
     let frameExtractor = VideoFrameExtractor()
     let videoAnalyzer = VideoAnalyzer(apiKey: apiKey)
-    let screenRecorder = await MainActor.run { ScreenRecorder() }
+    let screenRecorder = ScreenRecorder()
 
     // Define tools with Value-based input schemas
     let tools: [MCPTool] = [
@@ -115,15 +379,12 @@ struct ArgusMCPServer: AsyncParsableCommand {
             "mode": .object([
               "type": "string",
               "description": """
-                Analysis mode based on intent:
-                - 'quick_look': Fast overview of video content (15 frames, 0.5fps)
-                - 'explain': Detailed explanation of what happens (30 frames, 1fps)
-                - 'test_animation': Frame-by-frame animation analysis for QA testing (180 frames, 60fps)
-                - 'find_bugs': Look for visual glitches, stutters, UI issues (60 frames, 2fps)
-                - 'accessibility': Check text readability, contrast, UI elements (30 frames, 1fps, high detail)
-                - 'compare_frames': Detailed pixel-level comparison between frames (120 frames, 30fps)
+                Analysis quality level:
+                - 'low': Fast overview (~$0.001) - Quick summary, 15 frames at 0.5fps
+                - 'auto': Balanced detail (~$0.003) - Good for most tasks, 30 frames at 1fps
+                - 'high': Comprehensive analysis (~$0.05+, ⚠️ higher cost) - Frame-by-frame analysis at 30fps, catches animations, bugs, and accessibility issues
                 """,
-              "enum": .array(["quick_look", "explain", "test_animation", "find_bugs", "accessibility", "compare_frames"])
+              "enum": .array(["low", "auto", "high"])
             ]),
             "custom_prompt": .object([
               "type": "string",
@@ -146,108 +407,57 @@ struct ArgusMCPServer: AsyncParsableCommand {
           "properties": .object([
             "duration_seconds": .object([
               "type": "integer",
-              "description": "Duration to record in seconds (required)"
+              "description": "Duration to record in seconds. If not provided, recording runs until user clicks Stop (max 30s)."
             ]),
-            "analysis_quality": .object([
+            "mode": .object([
               "type": "string",
-              "description": "Analysis quality: 'fast', 'default', or 'detailed'",
-              "enum": .array(["fast", "default", "detailed"])
+              "description": """
+                Analysis quality level:
+                - 'low': Fast overview (~$0.001) - Quick summary
+                - 'auto': Balanced detail (~$0.003) - Good for most tasks
+                - 'high': Comprehensive analysis (~$0.05+, ⚠️ higher cost) - Frame-by-frame, catches animations/bugs/accessibility
+                """,
+              "enum": .array(["low", "auto", "high"])
             ]),
             "custom_prompt": .object([
               "type": "string",
               "description": "Optional custom system prompt for analysis"
             ])
           ]),
-          "required": .array(["duration_seconds"])
-        ])
-      ),
-
-      MCPTool(
-        name: "record_simulator_and_analyze",
-        description: """
-          Record the iOS Simulator for a specified duration and automatically analyze
-          the animation/UI. Perfect for QA testing animations and transitions.
-          """,
-        inputSchema: .object([
-          "type": "object",
-          "properties": .object([
-            "duration_seconds": .object([
-              "type": "integer",
-              "description": "Duration to record in seconds"
-            ]),
-            "mode": .object([
-              "type": "string",
-              "description": "Analysis mode: 'test_animation', 'find_bugs', 'accessibility', 'explain'",
-              "enum": .array(["test_animation", "find_bugs", "accessibility", "explain"])
-            ]),
-            "custom_prompt": .object([
-              "type": "string",
-              "description": "Optional custom analysis prompt"
-            ])
-          ]),
-          "required": .array(["duration_seconds"])
-        ])
-      ),
-
-      MCPTool(
-        name: "record_app_and_analyze",
-        description: """
-          Record a specific application window by name and automatically analyze it with AI.
-          Perfect for testing UI, animations, and interactions in any app (Safari, Chrome, etc.).
-          """,
-        inputSchema: .object([
-          "type": "object",
-          "properties": .object([
-            "app_name": .object([
-              "type": "string",
-              "description": "Name of the application to record (e.g., 'Safari', 'Chrome', 'Finder')"
-            ]),
-            "duration_seconds": .object([
-              "type": "integer",
-              "description": "Duration to record in seconds"
-            ]),
-            "mode": .object([
-              "type": "string",
-              "description": "Analysis mode: 'test_animation', 'find_bugs', 'accessibility', 'explain'",
-              "enum": .array(["test_animation", "find_bugs", "accessibility", "explain"])
-            ]),
-            "custom_prompt": .object([
-              "type": "string",
-              "description": "Optional custom analysis prompt"
-            ])
-          ]),
-          "required": .array(["app_name", "duration_seconds"])
+          "required": .array(["mode"])
         ])
       ),
 
       MCPTool(
         name: "select_record_and_analyze",
         description: """
-          Complete workflow: Opens visual selection, records the selected region
-          for the specified duration, then analyzes it with OpenAI Vision.
-          Perfect for testing specific UI areas or animations.
-
-          Two modes:
-          - Timed: Provide duration_seconds for countdown timer that auto-stops
-          - Manual: Omit duration_seconds to show elapsed time; user clicks Stop to end (30s max)
+          Opens a visual crosshair overlay to select a specific screen region, then records
+          that region for a specified duration and analyzes it. Perfect for testing specific
+          UI components without recording the entire screen.
           """,
         inputSchema: .object([
           "type": "object",
           "properties": .object([
             "duration_seconds": .object([
               "type": "integer",
-              "description": "Duration to record in seconds. If omitted, recording runs until user clicks Stop (30s max)."
+              "description": "Duration to record in seconds. If not provided, recording runs until user clicks Stop (max 30s)."
             ]),
             "mode": .object([
               "type": "string",
-              "description": "Analysis mode: 'test_animation', 'find_bugs', 'accessibility', 'explain'",
-              "enum": .array(["test_animation", "find_bugs", "accessibility", "explain"])
+              "description": """
+                Analysis quality level:
+                - 'low': Fast overview (~$0.001) - Quick summary
+                - 'auto': Balanced detail (~$0.003) - Good for most tasks
+                - 'high': Comprehensive analysis (~$0.05+, ⚠️ higher cost) - Frame-by-frame, catches animations/bugs/accessibility
+                """,
+              "enum": .array(["low", "auto", "high"])
             ]),
             "custom_prompt": .object([
               "type": "string",
               "description": "Optional custom analysis prompt"
             ])
-          ])
+          ]),
+          "required": .array(["mode"])
         ])
       )
     ]
@@ -383,10 +593,11 @@ func handleAnalyzeVideo(
 
   if let mode = arguments["mode"]?.stringValue {
     switch mode {
-    case "quick_look":
+    case "low":
+      // Fast overview - quick summary
       analysisConfig = VideoAnalyzer.AnalysisConfig(
         batchSize: 8,
-        model: "gpt-4o-mini",
+        model: defaultVisionModel,
         maxTokensPerBatch: 500,
         systemPrompt: "Provide a quick, concise summary of what happens in this video. Focus on the main content and key moments.",
         imageDetail: "low",
@@ -397,10 +608,11 @@ func handleAnalyzeVideo(
       targetWidth = 512
       compressionQuality = 0.7
 
-    case "explain":
+    case "auto":
+      // Balanced analysis - good for most tasks
       analysisConfig = VideoAnalyzer.AnalysisConfig(
         batchSize: 5,
-        model: "gpt-4o-mini",
+        model: defaultVisionModel,
         maxTokensPerBatch: 1500,
         systemPrompt: """
           Explain in detail what happens in this video. Describe:
@@ -418,94 +630,45 @@ func handleAnalyzeVideo(
       targetWidth = 1024
       compressionQuality = 0.8
 
-    case "test_animation":
+    case "high":
+      // Comprehensive frame-by-frame analysis
       analysisConfig = VideoAnalyzer.AnalysisConfig(
-        batchSize: 10,
-        model: "gpt-4o-mini",
+        batchSize: 5,
+        model: defaultVisionModel,
         maxTokensPerBatch: 2000,
         systemPrompt: """
-          You are a QA engineer testing UI animations. Analyze these sequential frames and report:
-          1. TIMING: Estimate the easing curve (ease-in, ease-out, ease-in-out, linear, spring/bounce)
-          2. SMOOTHNESS: Any dropped frames, stutters, or jerky motion?
-          3. CONSISTENCY: Does the animation maintain consistent speed/acceleration?
-          4. START/END STATES: Are initial and final positions correct?
-          5. ISSUES: Any visual glitches, clipping, z-index problems, or artifacts?
+          You are a QA engineer performing comprehensive video analysis. Examine each frame carefully and report on:
+
+          ## ANIMATIONS
+          - Timing and easing curves (ease-in, ease-out, linear, spring/bounce)
+          - Smoothness - any dropped frames, stutters, or jerky motion?
+          - Start/end states - are initial and final positions correct?
+
+          ## VISUAL BUGS
+          - Glitches, artifacts, incorrect rendering, clipping issues
+          - Misaligned elements, overlapping content, broken layouts
+          - Text truncation, overflow, incorrect formatting
+
+          ## ACCESSIBILITY
+          - Text readability and contrast (WCAG AA compliance)
+          - Touch target sizes (44pt minimum for interactive elements)
+          - Color-only indicators that may be problematic
+          - Visual hierarchy clarity
+
+          ## STATE CONSISTENCY
+          - Wrong colors, missing elements, incorrect data
+          - UI state errors or inconsistencies
+
           Be precise with frame numbers and timestamps when reporting issues.
-          """,
-        imageDetail: "high",
-        temperature: 0.1
-      )
-      framesPerSecond = 60.0
-      maxFrames = 180
-      targetWidth = 1024
-      compressionQuality = 0.75
-
-    case "find_bugs":
-      analysisConfig = VideoAnalyzer.AnalysisConfig(
-        batchSize: 5,
-        model: "gpt-4o-mini",
-        maxTokensPerBatch: 1500,
-        systemPrompt: """
-          You are a QA engineer looking for bugs and issues. Carefully examine each frame for:
-          1. VISUAL BUGS: Glitches, artifacts, incorrect rendering, clipping issues
-          2. UI ISSUES: Misaligned elements, overlapping content, broken layouts
-          3. TEXT PROBLEMS: Truncation, overflow, incorrect formatting, typos
-          4. STATE ERRORS: Wrong colors, missing elements, incorrect data
-          5. ANIMATION ISSUES: Stutters, jumps, incomplete transitions
-          Report each issue with the frame number/timestamp and specific location.
-          """,
-        imageDetail: "high",
-        temperature: 0.1
-      )
-      framesPerSecond = 2.0
-      maxFrames = 60
-      targetWidth = 1920
-      compressionQuality = 0.9
-
-    case "accessibility":
-      analysisConfig = VideoAnalyzer.AnalysisConfig(
-        batchSize: 5,
-        model: "gpt-4o-mini",
-        maxTokensPerBatch: 1500,
-        systemPrompt: """
-          Evaluate this UI for accessibility concerns:
-          1. TEXT: Is text readable? Appropriate size? Sufficient contrast?
-          2. COLORS: Are there contrast issues? Color-only indicators?
-          3. TOUCH TARGETS: Are interactive elements large enough (44pt minimum)?
-          4. LABELS: Are UI elements clearly labeled?
-          5. HIERARCHY: Is the visual hierarchy clear?
-          6. MOTION: Any animations that could cause issues for motion-sensitive users?
-          Provide specific recommendations for improvements.
-          """,
-        imageDetail: "high",
-        temperature: 0.2
-      )
-      framesPerSecond = 1.0
-      maxFrames = 30
-      targetWidth = 1920
-      compressionQuality = 0.9
-
-    case "compare_frames":
-      analysisConfig = VideoAnalyzer.AnalysisConfig(
-        batchSize: 6,
-        model: "gpt-4o-mini",
-        maxTokensPerBatch: 2000,
-        systemPrompt: """
-          Compare consecutive frames and identify exact differences:
-          1. POSITION CHANGES: Which elements moved? By approximately how many pixels?
-          2. SIZE CHANGES: Any elements that grew or shrank?
-          3. OPACITY/COLOR: Changes in transparency or color values
-          4. VISIBILITY: Elements that appeared or disappeared
-          5. STATE CHANGES: Buttons, toggles, or other state indicators
-          Be as precise as possible with measurements and locations.
+          Provide specific recommendations for any problems found.
           """,
         imageDetail: "high",
         temperature: 0.1
       )
       framesPerSecond = 30.0
       maxFrames = 120
-      targetWidth = 1280
-      compressionQuality = 0.8
+      targetWidth = 1920
+      compressionQuality = 0.9
 
     default:
       break
@@ -549,151 +712,60 @@ func handleRecordAndAnalyze(
   videoAnalyzer: VideoAnalyzer,
   screenRecorder: ScreenRecorder
 ) async throws -> String {
-  guard let durationSeconds = arguments["duration_seconds"]?.intValue else {
-    throw ToolError.missingArgument("duration_seconds")
-  }
+  // Duration is optional: nil = manual mode, Int = timed mode (capped at 30s)
+  let durationSeconds = arguments["duration_seconds"]?.intValue
+  let mode = AnalysisMode(rawValue: arguments["mode"]?.stringValue ?? "auto") ?? .auto
+  let effectiveDuration = durationSeconds.map { min($0, RecordingOrchestrator.maxDuration) } ?? RecordingOrchestrator.maxDuration
 
-  // Enforce max duration of 30 seconds
-  let effectiveDuration = min(durationSeconds, 30)
-
-  // Launch recording status UI
-  let statusUI = await MainActor.run { RecordingStatusUI() }
-
-  // Try to launch UI (continue without it if it fails)
-  let uiEvents: AsyncStream<RecordingStatusUI.UIEvent>?
-  do {
-    uiEvents = try await statusUI.launch(config: .init(durationSeconds: effectiveDuration))
-  } catch {
-    // Log warning but continue without UI
-    FileHandle.standardError.write("Warning: Could not launch recording status UI: \(error)\n".data(using: .utf8)!)
-    uiEvents = nil
-  }
-
-  // Start recording with event stream for precise duration synchronization
+  // Start recording
   let eventStream = try await screenRecorder.startRecordingWithEvents()
+  let (videoURL, statusUI) = try await RecordingOrchestrator.performRecording(
+    eventStream: eventStream,
+    durationSeconds: durationSeconds,
+    screenRecorder: screenRecorder
+  )
 
-  var videoURL: URL?
+  // Analyze video
+  var analysisSucceeded = false
+  var extraction: VideoFrameExtractor.ExtractionResult?
+  var analysis: VideoAnalyzer.VideoAnalysisResult?
 
-  // Wait for first frame before starting timer
-  for await event in eventStream {
-    switch event {
-    case .started(let url):
-      videoURL = url
-      // Recording infrastructure ready, but don't start timer yet
-
-    case .firstFrameCaptured:
-      // Notify UI that recording has started
-      await statusUI.notifyRecordingStarted()
-
-      // Race between duration timer and UI stop events
-      if let uiEvents = uiEvents {
-        // Use withTaskGroup to race between timer and UI events
-        await withTaskGroup(of: Void.self) { group in
-          // Timer task
-          group.addTask {
-            try? await Task.sleep(for: .seconds(effectiveDuration))
-            _ = try? await screenRecorder.stopRecording()
-          }
-
-          // UI events task
-          group.addTask {
-            for await event in uiEvents {
-              switch event {
-              case .stopClicked, .timeout:
-                _ = try? await screenRecorder.stopRecording()
-                return
-              case .ready, .processExited:
-                break
-              }
-            }
-          }
-
-          // Wait for first task to complete (either timer or stop button)
-          await group.next()
-          // Cancel remaining tasks
-          group.cancelAll()
-        }
-      } else {
-        // No UI, just wait for duration
-        try await Task.sleep(for: .seconds(effectiveDuration))
-        _ = try await screenRecorder.stopRecording()
-      }
-
-    case .stopped(let url):
-      videoURL = url
-      // Notify UI to show analyzing state
-      await statusUI.notifyAnalyzing()
-
-    case .error(let message):
-      await statusUI.notifyError()
-      try? await Task.sleep(for: .seconds(1.5))
-      await MainActor.run { statusUI.terminate() }
-      throw ToolError.invalidArgument(message)
-    }
-  }
-
-  guard let finalURL = videoURL else {
-    await statusUI.notifyError()
-    try? await Task.sleep(for: .seconds(1.5))
-    await MainActor.run { statusUI.terminate() }
-    throw ToolError.invalidArgument("Recording failed - no output URL")
-  }
-
-  // Prepare analysis config
-  var analysisConfig: VideoAnalyzer.AnalysisConfig = .default
-  var extractionConfig: VideoFrameExtractor.ExtractionConfig = .default
-
-  if let quality = arguments["analysis_quality"]?.stringValue {
-    switch quality {
-    case "fast":
-      analysisConfig = .fast
-      extractionConfig = .fast
-    case "detailed":
-      analysisConfig = .detailed
-      extractionConfig = .highQuality
-    default:
-      break
-    }
-  }
-
-  if let customPrompt = arguments["custom_prompt"]?.stringValue {
-    analysisConfig = VideoAnalyzer.AnalysisConfig(
-      batchSize: analysisConfig.batchSize,
-      model: analysisConfig.model,
-      maxTokensPerBatch: analysisConfig.maxTokensPerBatch,
-      systemPrompt: customPrompt,
-      imageDetail: analysisConfig.imageDetail,
-      temperature: analysisConfig.temperature
-    )
-  }
-
-  // Extract and analyze
   do {
-    let extractionResult = try await frameExtractor.extractFrames(from: finalURL, config: extractionConfig)
-    let analysisResult = try await videoAnalyzer.analyze(
-      extractionResult: extractionResult,
-      config: analysisConfig
+    let result = try await analyzeVideo(
+      url: videoURL,
+      mode: mode,
+      context: "screen recording",
+      customPrompt: arguments["custom_prompt"]?.stringValue,
+      effectiveDuration: effectiveDuration,
+      frameExtractor: frameExtractor,
+      videoAnalyzer: videoAnalyzer
     )
-
-    // Show success state briefly before closing UI
-    await statusUI.notifySuccess()
-    try? await Task.sleep(for: .seconds(1.5))
-    await statusUI.notifyRecordingStopped()
-
-    return """
-      Recording completed and analyzed.
-      Video file: \(finalURL.path)
-      Duration: \(durationSeconds) seconds
-
-      \(formatAnalysisResult(extraction: extractionResult, analysis: analysisResult))
-      """
+    extraction = result.extraction
+    analysis = result.analysis
+    analysisSucceeded = true
   } catch {
-    // Show error state briefly before closing UI
-    await statusUI.notifyError()
-    try? await Task.sleep(for: .seconds(1.5))
-    await statusUI.notifyRecordingStopped()
-    throw error
+    analysisSucceeded = false
   }
+
+  // Finalize UI
+  if let statusUI = statusUI {
+    await RecordingOrchestrator.finalizeWithUI(success: analysisSucceeded, statusUI: statusUI)
+  }
+
+  // Re-throw if analysis failed
+  guard analysisSucceeded, let extraction = extraction, let analysis = analysis else {
+    throw ToolError.invalidArgument("Video analysis failed")
+  }
+
+  let durationText = durationSeconds.map { "\($0) seconds" } ?? "manual (user stopped)"
+
+  return """
+    Recording completed and analyzed.
+    Video file: \(videoURL.path)
+    Duration: \(durationText)
+
+    \(formatAnalysisResult(extraction: extraction, analysis: analysis))
+    """
 }
 
 // MARK: - App Recording Handlers
@@ -704,9 +776,10 @@ func handleRecordSimulatorAndAnalyze(
   videoAnalyzer: VideoAnalyzer,
   screenRecorder: ScreenRecorder
 ) async throws -> String {
-  guard let durationSeconds = arguments["duration_seconds"]?.intValue else {
-    throw ToolError.missingArgument("duration_seconds")
-  }
+  // Duration is optional: nil = manual mode, Int = timed mode (capped at 30s)
+  let durationSeconds = arguments["duration_seconds"]?.intValue
+  let mode = AnalysisMode(rawValue: arguments["mode"]?.stringValue ?? "auto") ?? .auto
+  let effectiveDuration = durationSeconds.map { min($0, RecordingOrchestrator.maxDuration) } ?? RecordingOrchestrator.maxDuration
 
   // Configure recording for simulator (60fps for animations)
   let recordingConfig = ScreenRecorder.RecordingConfig(
@@ -718,170 +791,59 @@ func handleRecordSimulatorAndAnalyze(
     quality: .high
   )
 
-  // Start recording with event stream for precise duration synchronization
+  // Start recording
   let eventStream = try await screenRecorder.startRecordingWithEvents(
     appName: "Simulator",
     config: recordingConfig,
     outputPath: nil
   )
-
-  var videoURL: URL?
-
-  // Wait for first frame before starting timer
-  for await event in eventStream {
-    switch event {
-    case .started(let url):
-      videoURL = url
-
-    case .firstFrameCaptured:
-      // NOW start the duration timer - first actual frame captured
-      try await Task.sleep(for: .seconds(durationSeconds))
-      _ = try await screenRecorder.stopRecording()
-
-    case .stopped(let url):
-      videoURL = url
-
-    case .error(let message):
-      throw ToolError.invalidArgument(message)
-    }
-  }
-
-  guard let finalURL = videoURL else {
-    throw ToolError.invalidArgument("Recording failed - no output URL")
-  }
-
-  // Determine analysis mode
-  let mode = arguments["mode"]?.stringValue ?? "test_animation"
-
-  var analysisConfig: VideoAnalyzer.AnalysisConfig
-  var framesPerSecond: Double
-  var maxFrames: Int
-  var targetWidth: Int
-  var compressionQuality: Double
-
-  switch mode {
-  case "test_animation":
-    analysisConfig = VideoAnalyzer.AnalysisConfig(
-      batchSize: 10,
-      model: "gpt-4o-mini",
-      maxTokensPerBatch: 2000,
-      systemPrompt: """
-        You are a QA engineer testing UI animations in an iOS Simulator. Analyze these sequential frames and report:
-        1. TIMING: Estimate the easing curve (ease-in, ease-out, ease-in-out, linear, spring/bounce)
-        2. SMOOTHNESS: Any dropped frames, stutters, or jerky motion?
-        3. CONSISTENCY: Does the animation maintain consistent speed/acceleration?
-        4. START/END STATES: Are initial and final positions correct?
-        5. ISSUES: Any visual glitches, clipping, z-index problems, or artifacts?
-        Be precise with frame numbers and timestamps when reporting issues.
-        """,
-      imageDetail: "high",
-      temperature: 0.1
-    )
-    framesPerSecond = 60.0
-    maxFrames = min(durationSeconds * 60, 180)
-    targetWidth = 1024
-    compressionQuality = 0.75
-
-  case "find_bugs":
-    analysisConfig = VideoAnalyzer.AnalysisConfig(
-      batchSize: 5,
-      model: "gpt-4o-mini",
-      maxTokensPerBatch: 1500,
-      systemPrompt: """
-        You are a QA engineer testing an iOS app in the Simulator. Look for bugs and issues:
-        1. VISUAL BUGS: Glitches, artifacts, incorrect rendering, clipping issues
-        2. UI ISSUES: Misaligned elements, overlapping content, broken layouts
-        3. TEXT PROBLEMS: Truncation, overflow, incorrect formatting
-        4. STATE ERRORS: Wrong colors, missing elements, incorrect data
-        5. ANIMATION ISSUES: Stutters, jumps, incomplete transitions
-        Report each issue with the frame number/timestamp and specific location.
-        """,
-      imageDetail: "high",
-      temperature: 0.1
-    )
-    framesPerSecond = 2.0
-    maxFrames = min(durationSeconds * 2, 60)
-    targetWidth = 1920
-    compressionQuality = 0.9
-
-  case "accessibility":
-    analysisConfig = VideoAnalyzer.AnalysisConfig(
-      batchSize: 5,
-      model: "gpt-4o-mini",
-      maxTokensPerBatch: 1500,
-      systemPrompt: """
-        Evaluate this iOS app UI for accessibility concerns:
-        1. TEXT: Is text readable? Appropriate size? Sufficient contrast?
-        2. COLORS: Are there contrast issues? Color-only indicators?
-        3. TOUCH TARGETS: Are interactive elements large enough (44pt minimum)?
-        4. LABELS: Are UI elements clearly labeled?
-        5. HIERARCHY: Is the visual hierarchy clear?
-        6. MOTION: Any animations that could cause issues for motion-sensitive users?
-        Provide specific recommendations for improvements.
-        """,
-      imageDetail: "high",
-      temperature: 0.2
-    )
-    framesPerSecond = 1.0
-    maxFrames = min(durationSeconds, 30)
-    targetWidth = 1920
-    compressionQuality = 0.9
-
-  default:  // "explain" or unknown
-    analysisConfig = VideoAnalyzer.AnalysisConfig(
-      batchSize: 5,
-      model: "gpt-4o-mini",
-      maxTokensPerBatch: 1500,
-      systemPrompt: """
-        Explain what happens in this iOS Simulator recording. Describe:
-        1. The overall content and context of the app
-        2. Step-by-step user interactions and responses
-        3. Screen transitions and navigation flow
-        4. Important UI elements and their states
-        Be thorough and descriptive.
-        """,
-      imageDetail: "auto",
-      temperature: 0.3
-    )
-    framesPerSecond = 1.0
-    maxFrames = 30
-    targetWidth = 1024
-    compressionQuality = 0.8
-  }
-
-  // Apply custom prompt if provided
-  if let customPrompt = arguments["custom_prompt"]?.stringValue {
-    analysisConfig = VideoAnalyzer.AnalysisConfig(
-      batchSize: analysisConfig.batchSize,
-      model: analysisConfig.model,
-      maxTokensPerBatch: analysisConfig.maxTokensPerBatch,
-      systemPrompt: customPrompt,
-      imageDetail: analysisConfig.imageDetail,
-      temperature: analysisConfig.temperature
-    )
-  }
-
-  let extractionConfig = VideoFrameExtractor.ExtractionConfig(
-    framesPerSecond: framesPerSecond,
-    maxFrames: maxFrames,
-    targetWidth: targetWidth,
-    compressionQuality: compressionQuality
+  let (videoURL, statusUI) = try await RecordingOrchestrator.performRecording(
+    eventStream: eventStream,
+    durationSeconds: durationSeconds,
+    screenRecorder: screenRecorder
   )
 
-  // Extract and analyze
-  let extractionResult = try await frameExtractor.extractFrames(from: finalURL, config: extractionConfig)
-  let analysisResult = try await videoAnalyzer.analyze(
-    extractionResult: extractionResult,
-    config: analysisConfig
-  )
+  // Analyze video
+  var analysisSucceeded = false
+  var extraction: VideoFrameExtractor.ExtractionResult?
+  var analysis: VideoAnalyzer.VideoAnalysisResult?
+
+  do {
+    let result = try await analyzeVideo(
+      url: videoURL,
+      mode: mode,
+      context: "iOS Simulator recording",
+      customPrompt: arguments["custom_prompt"]?.stringValue,
+      effectiveDuration: effectiveDuration,
+      frameExtractor: frameExtractor,
+      videoAnalyzer: videoAnalyzer
+    )
+    extraction = result.extraction
+    analysis = result.analysis
+    analysisSucceeded = true
+  } catch {
+    analysisSucceeded = false
+  }
+
+  // Finalize UI
+  if let statusUI = statusUI {
+    await RecordingOrchestrator.finalizeWithUI(success: analysisSucceeded, statusUI: statusUI)
+  }
+
+  // Re-throw if analysis failed
+  guard analysisSucceeded, let extraction = extraction, let analysis = analysis else {
+    throw ToolError.invalidArgument("Video analysis failed")
+  }
+
+  let durationText = durationSeconds.map { "\($0) seconds" } ?? "manual (user stopped)"
 
   return """
     iOS Simulator recording completed and analyzed.
-    Video file: \(finalURL.path)
-    Duration: \(durationSeconds) seconds
-    Analysis mode: \(mode)
+    Video file: \(videoURL.path)
+    Duration: \(durationText)
+    Analysis mode: \(mode.rawValue)
 
-    \(formatAnalysisResult(extraction: extractionResult, analysis: analysisResult))
+    \(formatAnalysisResult(extraction: extraction, analysis: analysis))
     """
 }
 
@@ -895,13 +857,14 @@ func handleRecordAppAndAnalyze(
     throw ToolError.missingArgument("app_name")
   }
 
-  guard let durationSeconds = arguments["duration_seconds"]?.intValue else {
-    throw ToolError.missingArgument("duration_seconds")
-  }
+  // Duration is optional: nil = manual mode, Int = timed mode (capped at 30s)
+  let durationSeconds = arguments["duration_seconds"]?.intValue
+  let mode = AnalysisMode(rawValue: arguments["mode"]?.stringValue ?? "auto") ?? .auto
+  let effectiveDuration = durationSeconds.map { min($0, RecordingOrchestrator.maxDuration) } ?? RecordingOrchestrator.maxDuration
 
   // Configure recording for app window (60fps for animations)
   let recordingConfig = ScreenRecorder.RecordingConfig(
-    width: 0,  // Will be determined by window size
+    width: 0,
     height: 0,
     fps: 60,
     showsCursor: true,
@@ -909,170 +872,59 @@ func handleRecordAppAndAnalyze(
     quality: .high
   )
 
-  // Start recording with event stream for precise duration synchronization
+  // Start recording
   let eventStream = try await screenRecorder.startRecordingWithEvents(
     appName: appName,
     config: recordingConfig,
     outputPath: nil
   )
-
-  var videoURL: URL?
-
-  // Wait for first frame before starting timer
-  for await event in eventStream {
-    switch event {
-    case .started(let url):
-      videoURL = url
-
-    case .firstFrameCaptured:
-      // NOW start the duration timer - first actual frame captured
-      try await Task.sleep(for: .seconds(durationSeconds))
-      _ = try await screenRecorder.stopRecording()
-
-    case .stopped(let url):
-      videoURL = url
-
-    case .error(let message):
-      throw ToolError.invalidArgument(message)
-    }
-  }
-
-  guard let finalURL = videoURL else {
-    throw ToolError.invalidArgument("Recording failed - no output URL for '\(appName)'")
-  }
-
-  // Determine analysis mode
-  let mode = arguments["mode"]?.stringValue ?? "explain"
-
-  var analysisConfig: VideoAnalyzer.AnalysisConfig
-  var framesPerSecond: Double
-  var maxFrames: Int
-  var targetWidth: Int
-  var compressionQuality: Double
-
-  switch mode {
-  case "test_animation":
-    analysisConfig = VideoAnalyzer.AnalysisConfig(
-      batchSize: 10,
-      model: "gpt-4o-mini",
-      maxTokensPerBatch: 2000,
-      systemPrompt: """
-        You are a QA engineer testing UI animations in '\(appName)'. Analyze these sequential frames and report:
-        1. TIMING: Estimate the easing curve (ease-in, ease-out, ease-in-out, linear, spring/bounce)
-        2. SMOOTHNESS: Any dropped frames, stutters, or jerky motion?
-        3. CONSISTENCY: Does the animation maintain consistent speed/acceleration?
-        4. START/END STATES: Are initial and final positions correct?
-        5. ISSUES: Any visual glitches, clipping, z-index problems, or artifacts?
-        Be precise with frame numbers and timestamps when reporting issues.
-        """,
-      imageDetail: "high",
-      temperature: 0.1
-    )
-    framesPerSecond = 60.0
-    maxFrames = min(durationSeconds * 60, 180)
-    targetWidth = 1024
-    compressionQuality = 0.75
-
-  case "find_bugs":
-    analysisConfig = VideoAnalyzer.AnalysisConfig(
-      batchSize: 5,
-      model: "gpt-4o-mini",
-      maxTokensPerBatch: 1500,
-      systemPrompt: """
-        You are a QA engineer testing '\(appName)'. Look for bugs and issues:
-        1. VISUAL BUGS: Glitches, artifacts, incorrect rendering, clipping issues
-        2. UI ISSUES: Misaligned elements, overlapping content, broken layouts
-        3. TEXT PROBLEMS: Truncation, overflow, incorrect formatting
-        4. STATE ERRORS: Wrong colors, missing elements, incorrect data
-        5. ANIMATION ISSUES: Stutters, jumps, incomplete transitions
-        Report each issue with the frame number/timestamp and specific location.
-        """,
-      imageDetail: "high",
-      temperature: 0.1
-    )
-    framesPerSecond = 2.0
-    maxFrames = min(durationSeconds * 2, 60)
-    targetWidth = 1920
-    compressionQuality = 0.9
-
-  case "accessibility":
-    analysisConfig = VideoAnalyzer.AnalysisConfig(
-      batchSize: 5,
-      model: "gpt-4o-mini",
-      maxTokensPerBatch: 1500,
-      systemPrompt: """
-        Evaluate this '\(appName)' UI for accessibility concerns:
-        1. TEXT: Is text readable? Appropriate size? Sufficient contrast?
-        2. COLORS: Are there contrast issues? Color-only indicators?
-        3. TOUCH TARGETS: Are interactive elements large enough?
-        4. LABELS: Are UI elements clearly labeled?
-        5. HIERARCHY: Is the visual hierarchy clear?
-        6. MOTION: Any animations that could cause issues for motion-sensitive users?
-        Provide specific recommendations for improvements.
-        """,
-      imageDetail: "high",
-      temperature: 0.2
-    )
-    framesPerSecond = 1.0
-    maxFrames = min(durationSeconds, 30)
-    targetWidth = 1920
-    compressionQuality = 0.9
-
-  default:  // "explain" or unknown
-    analysisConfig = VideoAnalyzer.AnalysisConfig(
-      batchSize: 5,
-      model: "gpt-4o-mini",
-      maxTokensPerBatch: 1500,
-      systemPrompt: """
-        Explain what happens in this '\(appName)' recording. Describe:
-        1. The overall content and context of the application
-        2. Step-by-step user interactions and responses
-        3. Screen transitions and navigation flow
-        4. Important UI elements and their states
-        Be thorough and descriptive.
-        """,
-      imageDetail: "auto",
-      temperature: 0.3
-    )
-    framesPerSecond = 1.0
-    maxFrames = 30
-    targetWidth = 1024
-    compressionQuality = 0.8
-  }
-
-  // Apply custom prompt if provided
-  if let customPrompt = arguments["custom_prompt"]?.stringValue {
-    analysisConfig = VideoAnalyzer.AnalysisConfig(
-      batchSize: analysisConfig.batchSize,
-      model: analysisConfig.model,
-      maxTokensPerBatch: analysisConfig.maxTokensPerBatch,
-      systemPrompt: customPrompt,
-      imageDetail: analysisConfig.imageDetail,
-      temperature: analysisConfig.temperature
-    )
-  }
-
-  let extractionConfig = VideoFrameExtractor.ExtractionConfig(
-    framesPerSecond: framesPerSecond,
-    maxFrames: maxFrames,
-    targetWidth: targetWidth,
-    compressionQuality: compressionQuality
+  let (videoURL, statusUI) = try await RecordingOrchestrator.performRecording(
+    eventStream: eventStream,
+    durationSeconds: durationSeconds,
+    screenRecorder: screenRecorder
   )
 
-  // Extract and analyze
-  let extractionResult = try await frameExtractor.extractFrames(from: finalURL, config: extractionConfig)
-  let analysisResult = try await videoAnalyzer.analyze(
-    extractionResult: extractionResult,
-    config: analysisConfig
-  )
+  // Analyze video
+  var analysisSucceeded = false
+  var extraction: VideoFrameExtractor.ExtractionResult?
+  var analysis: VideoAnalyzer.VideoAnalysisResult?
+
+  do {
+    let result = try await analyzeVideo(
+      url: videoURL,
+      mode: mode,
+      context: "'\(appName)' recording",
+      customPrompt: arguments["custom_prompt"]?.stringValue,
+      effectiveDuration: effectiveDuration,
+      frameExtractor: frameExtractor,
+      videoAnalyzer: videoAnalyzer
+    )
+    extraction = result.extraction
+    analysis = result.analysis
+    analysisSucceeded = true
+  } catch {
+    analysisSucceeded = false
+  }
+
+  // Finalize UI
+  if let statusUI = statusUI {
+    await RecordingOrchestrator.finalizeWithUI(success: analysisSucceeded, statusUI: statusUI)
+  }
+
+  // Re-throw if analysis failed
+  guard analysisSucceeded, let extraction = extraction, let analysis = analysis else {
+    throw ToolError.invalidArgument("Video analysis failed")
+  }
+
+  let durationText = durationSeconds.map { "\($0) seconds" } ?? "manual (user stopped)"
 
   return """
     '\(appName)' recording completed and analyzed.
-    Video file: \(finalURL.path)
-    Duration: \(durationSeconds) seconds
-    Analysis mode: \(mode)
+    Video file: \(videoURL.path)
+    Duration: \(durationText)
+    Analysis mode: \(mode.rawValue)
 
-    \(formatAnalysisResult(extraction: extractionResult, analysis: analysisResult))
+    \(formatAnalysisResult(extraction: extraction, analysis: analysis))
     """
 }
 
@@ -1155,10 +1007,10 @@ func handleSelectRecordAndAnalyze(
   videoAnalyzer: VideoAnalyzer,
   screenRecorder: ScreenRecorder
 ) async throws -> String {
-  // duration_seconds is now optional
-  // - If provided: timed mode with countdown
-  // - If nil: manual mode with count-up (30s max)
+  // Duration is optional: nil = manual mode, Int = timed mode (capped at 30s)
   let durationSeconds = arguments["duration_seconds"]?.intValue
+  let mode = AnalysisMode(rawValue: arguments["mode"]?.stringValue ?? "auto") ?? .auto
+  let effectiveDuration = durationSeconds.map { min($0, RecordingOrchestrator.maxDuration) } ?? RecordingOrchestrator.maxDuration
 
   // First, launch the visual selector
   let selection = try await launchRegionSelector()
@@ -1187,246 +1039,62 @@ func handleSelectRecordAndAnalyze(
     quality: .high
   )
 
-  // Launch recording status UI
-  let statusUI = await MainActor.run { RecordingStatusUI() }
-
-  // Try to launch UI (continue without it if it fails)
-  // Pass durationSeconds (nil for manual mode = count-up timer)
-  let uiEvents: AsyncStream<RecordingStatusUI.UIEvent>?
-  do {
-    uiEvents = try await statusUI.launch(config: .init(durationSeconds: durationSeconds))
-  } catch {
-    FileHandle.standardError.write("Warning: Could not launch recording status UI: \(error)\n".data(using: .utf8)!)
-    uiEvents = nil
-  }
-
-  // Start recording with event stream for precise duration synchronization
+  // Start recording
   let eventStream = try await screenRecorder.startRecordingWithEvents(
     region: region,
     config: recordingConfig,
     outputPath: nil
   )
-
-  var videoURL: URL?
-
-  // Wait for first frame before starting timer
-  for await event in eventStream {
-    switch event {
-    case .started(let url):
-      videoURL = url
-
-    case .firstFrameCaptured:
-      // Notify UI that recording has started
-      await statusUI.notifyRecordingStarted()
-
-      // Race between duration timer (if timed mode) and UI stop events
-      if let uiEvents = uiEvents {
-        await withTaskGroup(of: Void.self) { group in
-          // Timer task (only if duration specified - timed mode)
-          if let duration = durationSeconds {
-            group.addTask {
-              try? await Task.sleep(for: .seconds(duration))
-              _ = try? await screenRecorder.stopRecording()
-            }
-          }
-
-          // UI events task (handles Stop button and timeout for manual mode)
-          group.addTask {
-            for await event in uiEvents {
-              switch event {
-              case .stopClicked, .timeout:
-                _ = try? await screenRecorder.stopRecording()
-                return
-              case .ready, .processExited:
-                break
-              }
-            }
-          }
-
-          // Wait for first task to complete
-          await group.next()
-          group.cancelAll()
-        }
-      } else {
-        // No UI available - use duration if provided, otherwise default to 5 seconds
-        let fallbackDuration = durationSeconds ?? 5
-        try await Task.sleep(for: .seconds(fallbackDuration))
-        _ = try await screenRecorder.stopRecording()
-      }
-
-    case .stopped(let url):
-      videoURL = url
-      // Notify UI to show analyzing state
-      await statusUI.notifyAnalyzing()
-
-    case .error(let message):
-      await statusUI.notifyError()
-      try? await Task.sleep(for: .seconds(1.5))
-      await MainActor.run { statusUI.terminate() }
-      throw ToolError.invalidArgument(message)
-    }
-  }
-
-  guard let finalURL = videoURL else {
-    await statusUI.notifyError()
-    try? await Task.sleep(for: .seconds(1.5))
-    await MainActor.run { statusUI.terminate() }
-    throw ToolError.invalidArgument("Recording failed - no output URL")
-  }
-
-  // Determine analysis mode
-  let mode = arguments["mode"]?.stringValue ?? "explain"
-
-  // For frame extraction, use actual duration or default to 30 (max for manual mode)
-  let effectiveDurationForFrames = durationSeconds ?? 30
-
-  var analysisConfig: VideoAnalyzer.AnalysisConfig
-  var framesPerSecond: Double
-  var maxFrames: Int
-  var targetWidth: Int
-  var compressionQuality: Double
-
-  switch mode {
-  case "test_animation":
-    analysisConfig = VideoAnalyzer.AnalysisConfig(
-      batchSize: 10,
-      model: "gpt-4o-mini",
-      maxTokensPerBatch: 2000,
-      systemPrompt: """
-        You are a QA engineer testing UI animations in a selected screen region. Analyze these sequential frames and report:
-        1. TIMING: Estimate the easing curve (ease-in, ease-out, ease-in-out, linear, spring/bounce)
-        2. SMOOTHNESS: Any dropped frames, stutters, or jerky motion?
-        3. CONSISTENCY: Does the animation maintain consistent speed/acceleration?
-        4. START/END STATES: Are initial and final positions correct?
-        5. ISSUES: Any visual glitches, clipping, z-index problems, or artifacts?
-        Be precise with frame numbers and timestamps when reporting issues.
-        """,
-      imageDetail: "high",
-      temperature: 0.1
-    )
-    framesPerSecond = 60.0
-    maxFrames = min(effectiveDurationForFrames * 60, 180)
-    targetWidth = 1024
-    compressionQuality = 0.75
-
-  case "find_bugs":
-    analysisConfig = VideoAnalyzer.AnalysisConfig(
-      batchSize: 5,
-      model: "gpt-4o-mini",
-      maxTokensPerBatch: 1500,
-      systemPrompt: """
-        You are a QA engineer looking for bugs in this screen region. Look for:
-        1. VISUAL BUGS: Glitches, artifacts, incorrect rendering, clipping issues
-        2. UI ISSUES: Misaligned elements, overlapping content, broken layouts
-        3. TEXT PROBLEMS: Truncation, overflow, incorrect formatting
-        4. STATE ERRORS: Wrong colors, missing elements, incorrect data
-        5. ANIMATION ISSUES: Stutters, jumps, incomplete transitions
-        Report each issue with the frame number/timestamp and specific location.
-        """,
-      imageDetail: "high",
-      temperature: 0.1
-    )
-    framesPerSecond = 2.0
-    maxFrames = min(effectiveDurationForFrames * 2, 60)
-    targetWidth = 1920
-    compressionQuality = 0.9
-
-  case "accessibility":
-    analysisConfig = VideoAnalyzer.AnalysisConfig(
-      batchSize: 5,
-      model: "gpt-4o-mini",
-      maxTokensPerBatch: 1500,
-      systemPrompt: """
-        Evaluate this screen region for accessibility concerns:
-        1. TEXT: Is text readable? Appropriate size? Sufficient contrast?
-        2. COLORS: Are there contrast issues? Color-only indicators?
-        3. TOUCH TARGETS: Are interactive elements large enough (44pt minimum)?
-        4. LABELS: Are UI elements clearly labeled?
-        5. HIERARCHY: Is the visual hierarchy clear?
-        6. MOTION: Any animations that could cause issues for motion-sensitive users?
-        Provide specific recommendations for improvements.
-        """,
-      imageDetail: "high",
-      temperature: 0.2
-    )
-    framesPerSecond = 1.0
-    maxFrames = min(effectiveDurationForFrames, 30)
-    targetWidth = 1920
-    compressionQuality = 0.9
-
-  default:  // "explain" or unknown
-    analysisConfig = VideoAnalyzer.AnalysisConfig(
-      batchSize: 5,
-      model: "gpt-4o-mini",
-      maxTokensPerBatch: 1500,
-      systemPrompt: """
-        Explain what happens in this screen recording. Describe:
-        1. The overall content and context
-        2. Step-by-step actions and events
-        3. Important UI elements, text, and visual information
-        4. The purpose and outcome of what's shown
-        Be thorough and educational in your explanation.
-        """,
-      imageDetail: "auto",
-      temperature: 0.3
-    )
-    framesPerSecond = 1.0
-    maxFrames = 30
-    targetWidth = 1024
-    compressionQuality = 0.8
-  }
-
-  // Apply custom prompt if provided
-  if let customPrompt = arguments["custom_prompt"]?.stringValue {
-    analysisConfig = VideoAnalyzer.AnalysisConfig(
-      batchSize: analysisConfig.batchSize,
-      model: analysisConfig.model,
-      maxTokensPerBatch: analysisConfig.maxTokensPerBatch,
-      systemPrompt: customPrompt,
-      imageDetail: analysisConfig.imageDetail,
-      temperature: analysisConfig.temperature
-    )
-  }
-
-  let extractionConfig = VideoFrameExtractor.ExtractionConfig(
-    framesPerSecond: framesPerSecond,
-    maxFrames: maxFrames,
-    targetWidth: targetWidth,
-    compressionQuality: compressionQuality
+  let (videoURL, statusUI) = try await RecordingOrchestrator.performRecording(
+    eventStream: eventStream,
+    durationSeconds: durationSeconds,
+    screenRecorder: screenRecorder
   )
 
-  // Extract and analyze
+  // Analyze video
+  var analysisSucceeded = false
+  var extraction: VideoFrameExtractor.ExtractionResult?
+  var analysis: VideoAnalyzer.VideoAnalysisResult?
+
   do {
-    let extractionResult = try await frameExtractor.extractFrames(from: finalURL, config: extractionConfig)
-    let analysisResult = try await videoAnalyzer.analyze(
-      extractionResult: extractionResult,
-      config: analysisConfig
+    let result = try await analyzeVideo(
+      url: videoURL,
+      mode: mode,
+      context: "screen recording",
+      customPrompt: arguments["custom_prompt"]?.stringValue,
+      effectiveDuration: effectiveDuration,
+      frameExtractor: frameExtractor,
+      videoAnalyzer: videoAnalyzer
     )
-
-    // Show success state briefly before closing UI
-    await statusUI.notifySuccess()
-    try? await Task.sleep(for: .seconds(1.5))
-    await statusUI.notifyRecordingStopped()
-
-    let durationText = durationSeconds.map { "\($0) seconds" } ?? "manual (user stopped)"
-
-    return """
-      Screen region recording completed and analyzed!
-
-      Selected region: \(selection.x), \(selection.y) - \(selection.width)x\(selection.height)
-      Video file: \(finalURL.path)
-      Duration: \(durationText)
-      Analysis mode: \(mode)
-
-      \(formatAnalysisResult(extraction: extractionResult, analysis: analysisResult))
-      """
+    extraction = result.extraction
+    analysis = result.analysis
+    analysisSucceeded = true
   } catch {
-    // Show error state briefly before closing UI
-    await statusUI.notifyError()
-    try? await Task.sleep(for: .seconds(1.5))
-    await statusUI.notifyRecordingStopped()
-    throw error
+    analysisSucceeded = false
   }
+
+  // Finalize UI
+  if let statusUI = statusUI {
+    await RecordingOrchestrator.finalizeWithUI(success: analysisSucceeded, statusUI: statusUI)
+  }
+
+  // Re-throw if analysis failed
+  guard analysisSucceeded, let extraction = extraction, let analysis = analysis else {
+    throw ToolError.invalidArgument("Video analysis failed")
+  }
+
+  let durationText = durationSeconds.map { "\($0) seconds" } ?? "manual (user stopped)"
+
+  return """
+    Screen region recording completed and analyzed!
+
+    Selected region: \(selection.x), \(selection.y) - \(selection.width)x\(selection.height)
+    Video file: \(videoURL.path)
+    Duration: \(durationText)
+    Analysis mode: \(mode.rawValue)
+
+    \(formatAnalysisResult(extraction: extraction, analysis: analysis))
+    """
 }
 
 // MARK: - Helper Functions
