@@ -1,6 +1,8 @@
-# Argus MCP - Video Analysis Server
+# Argus 
 
-A high-performance MCP (Model Context Protocol) server for video analysis using OpenAI's Vision API. Argus extracts frames from videos and analyzes them with GPT-4o-mini.
+<img width="2058" height="830" alt="Image" src="https://github.com/user-attachments/assets/8fd7f2fe-612a-42eb-b97e-7e54869cd383" />
+
+A MCP (Model Context Protocol) server for video analysis using OpenAI's Vision API. Argus extracts frames from videos and analyzes them.
 
 ## Requirements
 
@@ -217,7 +219,6 @@ Modal presentation with spring animation. Found 1 animation issue and 2 accessib
 
 Screen recording requires permissions:
 1. System Preferences -> Privacy & Security -> Screen Recording
-2. Enable for Terminal or your IDE
 
 ---
 
