@@ -53,16 +53,19 @@ Add to `~/.claude.json` under the `mcpServers` key:
 
 ## Analysis Modes
 
-Argus supports 6 analysis modes, each optimized for different use cases:
+Argus supports 3 simple quality-based modes:
 
-| Mode | FPS | Max Frames | Resolution | Batch Size | Image Detail | Tokens/Batch | Best For |
-|------|-----|------------|------------|------------|--------------|--------------|----------|
-| `quick_look` | 0.5 | 15 | 512px | 8 | low | 500 | Fast overview, getting the gist |
-| `explain` | 1.0 | 30 | 1024px | 5 | auto | 1500 | Detailed step-by-step explanation |
-| `test_animation` | 60.0 | 180 | 1024px | 10 | high | 2000 | QA testing animations at 60fps |
-| `find_bugs` | 2.0 | 60 | 1920px | 5 | high | 1500 | Finding visual glitches & UI issues |
-| `accessibility` | 1.0 | 30 | 1920px | 5 | high | 1500 | Checking contrast, text size, touch targets |
-| `compare_frames` | 30.0 | 120 | 1280px | 6 | high | 2000 | Pixel-level comparison between frames |
+| Mode | Description | FPS | Max Frames | Resolution | Est. Cost |
+|------|-------------|-----|------------|------------|-----------|
+| `low` | Fast overview, quick summary | 0.5 | 15 | 512px | ~$0.001 |
+| `medium` | Balanced detail, good for most tasks | 1.0 | 30 | 1024px | ~$0.003 |
+| `high` | Comprehensive frame-by-frame analysis | 30.0 | 120 | 1920px | ~$0.05+ |
+
+### Choosing the Right Mode
+
+- **`low`**: Use when you just need a quick summary of what's in the video
+- **`medium`**: Default choice for most tasks - explains what happens step-by-step
+- **`high`**: Use when you need to catch everything - animations, bugs, and accessibility issues combined
 
 ### How It Works
 
@@ -80,32 +83,30 @@ Argus supports 6 analysis modes, each optimized for different use cases:
 
 | Mode | Frames Sent | API Calls | Est. Input Tokens | Est. Output Tokens | Est. Cost |
 |------|-------------|-----------|-------------------|-------------------|-----------|
-| `quick_look` | 2 | 1 | ~1,500 | ~200 | ~$0.001 |
-| `explain` | 3 | 1 | ~2,500 | ~600 | ~$0.002 |
-| `find_bugs` | 6 | 2 | ~8,000 | ~1,200 | ~$0.006 |
-| `accessibility` | 3 | 1 | ~4,000 | ~800 | ~$0.003 |
-| `test_animation` | 180 | 18 | ~120,000 | ~12,000 | ~$0.08 |
-| `compare_frames` | 90 | 15 | ~90,000 | ~10,000 | ~$0.06 |
+| `low` | 2 | 1 | ~1,500 | ~200 | ~$0.001 |
+| `medium` | 3 | 1 | ~2,500 | ~600 | ~$0.003 |
+| `high` | 90 | 18 | ~90,000 | ~12,000 | ~$0.05+ |
 
-#### Token Usage Disclaimers
+#### Token Usage by Mode
 
-**🔴 High Token Usage Modes:**
+**🔴 `high` mode (⚠️ significantly higher cost):**
+- Captures at 30fps with up to **120 frames**
+- High-detail image mode at full resolution (1920px)
+- Comprehensive analysis: animations + bugs + accessibility
+- Expect **~90,000+ input tokens** for longer recordings
+- **Use for short clips (1-3 seconds) when you need to catch everything**
 
-- **`test_animation`**: Captures at 60fps and can send up to **180 frames** per analysis. Each frame is a base64 JPEG image (~85 tokens per image at 1024px). For a 3-second recording, expect **~120,000 input tokens**.
+**🟡 `medium` mode:**
+- Balanced approach with 1fps and auto detail (1024px)
+- Good for understanding what happens step-by-step
+- Expect **~2,500-5,000 input tokens**
+- **Default choice for most use cases**
 
-- **`compare_frames`**: Captures at 30fps with up to **120 frames**. Designed for detailed pixel comparison, uses high-detail image mode. Expect **~90,000 input tokens** for a 4-second video.
-
-**🟡 Medium Token Usage Modes:**
-
-- **`find_bugs`**: Captures at 2fps with high resolution (1920px). More tokens per image due to larger size. Expect **~8,000-15,000 input tokens** for typical recordings.
-
-- **`accessibility`**: Similar to find_bugs but fewer frames. Expect **~4,000-8,000 input tokens**.
-
-**🟢 Low Token Usage Modes:**
-
-- **`quick_look`**: Minimal frames (0.5fps), low resolution (512px), low detail mode. Most economical option. Expect **~1,500-3,000 input tokens**.
-
-- **`explain`**: Balanced approach with 1fps and auto detail. Expect **~2,500-5,000 input tokens**.
+**🟢 `low` mode:**
+- Minimal frames (0.5fps), low resolution (512px)
+- Most economical option
+- Expect **~1,500-3,000 input tokens**
+- **Use for quick checks or when cost is a priority**
 
 #### How Image Tokens Are Calculated
 
@@ -129,17 +130,14 @@ For a 1920×1080 image at high detail: `85 + (170 × 8) = 1,445 tokens`
 
 | Use Case | Recommended Mode | Why |
 |----------|------------------|-----|
-| "What's in this video?" | `quick_look` | Cheapest, fastest |
-| "Explain the user flow" | `explain` | Good balance |
-| "Check for visual bugs" | `find_bugs` | Worth the extra tokens for bug detection |
-| "Test this animation" | `test_animation` | **Use only when you need frame-by-frame analysis** |
-| "Is this accessible?" | `accessibility` | Focused analysis, reasonable cost |
-| "What changed between states?" | `compare_frames` | **Use for short clips only (1-2 seconds)** |
+| "What's in this video?" | `low` | Cheapest, fastest |
+| "Explain the user flow" | `medium` | Good balance of detail and cost |
+| "Test animation + find bugs" | `high` | Comprehensive analysis (keep recording short!) |
 
 #### Cost Control Tips
 
-1. **Start with `quick_look`** - Use it first to see if deeper analysis is needed
-2. **Limit recording duration** - For `test_animation`, keep recordings under 3 seconds
+1. **Start with `low`** - Use it first to see if deeper analysis is needed
+2. **Limit recording duration** - For `high` mode, keep recordings under 3 seconds
 3. **Use region selection** - Record only the specific UI component, not full screen
 4. **Custom `max_frames`** - Override default with lower values: `max_frames: 30`
 
@@ -147,13 +145,13 @@ For a 1920×1080 image at high detail: `85 + (170 × 8) = 1,445 tokens`
 
 ## Mode Examples
 
-### 1. `quick_look` - Fast Overview
+### 1. `low` - Fast Overview
 
 **When to use:** You want a quick summary of what happens in a video without detailed analysis.
 
 **Example prompt:**
 ```
-Analyze the video at /path/to/demo.mp4 with mode quick_look
+Analyze the video at /path/to/demo.mp4 with mode low
 ```
 
 **Expected output:**
@@ -186,13 +184,13 @@ briefly, then the screen transitions to a dashboard showing user statistics.
 
 ---
 
-### 2. `explain` - Detailed Explanation
+### 2. `medium` - Balanced Analysis
 
-**When to use:** You need a thorough, educational breakdown of everything that happens.
+**When to use:** You need a thorough explanation of everything that happens - the default for most tasks.
 
 **Example prompt:**
 ```
-Analyze the video at /path/to/tutorial.mp4 with mode explain
+Analyze the video at /path/to/tutorial.mp4 with mode medium
 ```
 
 **Expected output:**
@@ -234,13 +232,13 @@ cart review, payment method selection, and order confirmation.
 
 ---
 
-### 3. `test_animation` - Animation QA Testing
+### 3. `high` - Comprehensive Analysis
 
-**When to use:** You're testing UI animations and need frame-by-frame analysis of timing, smoothness, and easing curves.
+**When to use:** You need frame-by-frame analysis for animations, bug detection, and accessibility - all in one. Keep recordings short (1-3 seconds) due to higher cost.
 
 **Example prompt:**
 ```
-Record the Simulator for 2 seconds and analyze with mode test_animation
+Record the Simulator for 2 seconds and analyze with mode high
 ```
 
 **Expected output:**
@@ -254,18 +252,19 @@ Record the Simulator for 2 seconds and analyze with mode test_animation
 - Total Frames: 120
 
 ### Analysis Statistics
-- Frames Analyzed: 120
+- Frames Analyzed: 60
 - Batches Processed: 12
 - Total Tokens Used: 18432
 - Extraction Time: 1.24 seconds
 - Analysis Time: 24.56 seconds
 
 ### Summary
-Modal presentation animation with spring physics. Generally smooth with one
-minor timing inconsistency detected.
+Modal presentation animation with spring physics. Found 1 animation issue and 2 accessibility concerns.
 
 ### Detailed Frame Analysis
 **[0.00s - 0.17s]** (Frames 1-10)
+
+## ANIMATIONS
 TIMING: Animation begins with ease-out curve
 SMOOTHNESS: All frames present, no drops detected
 - Frame 1: Modal at y=2532 (off-screen)
@@ -279,218 +278,35 @@ SMOOTHNESS: Smooth interpolation between frames
 - Frame 15: Modal at y=633 (75% visible)
 - Frame 18: Modal at y=-42 (slight overshoot past target)
 - Frame 20: Modal at y=12 (bouncing back)
-ISSUE: Overshoot of 42px may be intentional spring effect
 
 **[0.33s - 0.50s]** (Frames 21-30)
 TIMING: Damping phase of spring animation
-CONSISTENCY: ⚠️ Frame 24-25 shows 8px jump (possible dropped frame)
+⚠️ ANIMATION ISSUE: Frame 24-25 shows 8px jump (possible dropped frame)
 - Frame 21: Modal at y=8
 - Frame 25: Modal at y=0 (final position)
 END STATE: Modal correctly positioned at y=0
 
-### Issues Found
-1. **Frame 24-25**: Possible dropped frame causing 8px position jump
-   - Severity: Minor
-   - Location: During spring damping phase
-   - Recommendation: Check for main thread blocking during this transition
-```
+## VISUAL BUGS
+No visual bugs detected.
 
----
-
-### 4. `find_bugs` - Visual Bug Detection
-
-**When to use:** QA testing to find visual glitches, layout issues, or rendering problems.
-
-**Example prompt:**
-```
-Select a region, record for 5 seconds, and find bugs
-```
-
-**Expected output:**
-```
-## Video Analysis Results
-
-### Video Information
-- Duration: 5.0 seconds
-- Resolution: 800x600
-- FPS: 30.0
-- Total Frames: 150
-
-### Analysis Statistics
-- Frames Analyzed: 10
-- Batches Processed: 2
-- Total Tokens Used: 2156
-- Extraction Time: 0.67 seconds
-- Analysis Time: 5.89 seconds
-
-### Summary
-Found 3 visual issues in the analyzed screen region.
-
-### Detailed Frame Analysis
-**[0.0s - 2.5s]**
-BUG #1 - TEXT TRUNCATION
-- Location: Navigation bar title
-- Frame: 2 (0.5s)
-- Issue: Title "Shopping Cart Items" truncated to "Shopping Cart It..."
-- Expected: Full title or proper ellipsis placement
-- Severity: Medium
-
-BUG #2 - LAYOUT OVERLAP
-- Location: Bottom sheet, lower-right corner
-- Frames: 3-6 (1.0s - 2.0s)
-- Issue: "Apply Coupon" button overlaps with price total label by 12px
-- Cause: Likely missing bottom padding on button container
-- Severity: High
-
-**[2.5s - 5.0s]**
-BUG #3 - Z-INDEX ISSUE
-- Location: Dropdown menu
-- Frame: 8 (3.5s)
-- Issue: Dropdown renders behind the floating action button
-- Expected: Dropdown should appear above all other elements
-- Severity: High
-
-### Summary of Issues
-| # | Type | Location | Severity |
-|---|------|----------|----------|
-| 1 | Text Truncation | Nav bar title | Medium |
-| 2 | Layout Overlap | Bottom sheet | High |
-| 3 | Z-Index | Dropdown menu | High |
-```
-
----
-
-### 5. `accessibility` - Accessibility Audit
-
-**When to use:** Checking if your UI meets accessibility guidelines (contrast, text size, touch targets).
-
-**Example prompt:**
-```
-Analyze /path/to/app-screenshot.mp4 with mode accessibility
-```
-
-**Expected output:**
-```
-## Video Analysis Results
-
-### Video Information
-- Duration: 3.0 seconds
-- Resolution: 1170x2532
-- FPS: 60.0
-- Total Frames: 180
-
-### Analysis Statistics
-- Frames Analyzed: 3
-- Batches Processed: 1
-- Total Tokens Used: 1834
-- Extraction Time: 0.41 seconds
-- Analysis Time: 4.23 seconds
-
-### Summary
-Found 4 accessibility concerns that should be addressed.
-
-### Detailed Frame Analysis
-**[0.0s - 3.0s]**
-
-#### TEXT ISSUES
+## ACCESSIBILITY
 1. **Insufficient Contrast**
-   - Location: Gray placeholder text in search field
-   - Issue: Light gray (#999) on white background fails WCAG AA
-   - Current ratio: ~2.8:1
-   - Required: 4.5:1 minimum
-   - Fix: Use #767676 or darker
+   - Location: Modal header subtitle
+   - Issue: Light gray text on white background
+   - Fix: Use darker gray (#767676 or darker)
 
-2. **Small Text Size**
-   - Location: Footer links ("Terms", "Privacy", "Help")
-   - Issue: Text appears to be ~10pt, below recommended 12pt minimum
-   - Fix: Increase to at least 12pt (16px)
+2. **Small Touch Target**
+   - Location: Close button (X) in modal header
+   - Issue: Appears to be ~30x30pt
+   - Required: 44x44pt minimum
+   - Fix: Increase tap area
 
-#### TOUCH TARGET ISSUES
-3. **Small Touch Target**
-   - Location: "X" close button (top-right of modal)
-   - Issue: Button appears to be ~30x30pt
-   - Required: 44x44pt minimum per Apple HIG
-   - Fix: Increase tap area with padding or larger hit area
-
-#### COLOR ISSUES
-4. **Color-Only Indicator**
-   - Location: Required field indicators
-   - Issue: Required fields marked only with red asterisk (*)
-   - Problem: Users with color blindness may not distinguish
-   - Fix: Add text label "Required" or additional visual indicator
-
-### Accessibility Score: 6/10
-Recommended priority: Fix contrast and touch target issues first.
-```
-
----
-
-### 6. `compare_frames` - Frame Comparison
-
-**When to use:** You need precise pixel-level differences between consecutive frames (debugging state changes, transitions).
-
-**Example prompt:**
-```
-Analyze the video at /path/to/state-change.mp4 with mode compare_frames
-```
-
-**Expected output:**
-```
-## Video Analysis Results
-
-### Video Information
-- Duration: 1.0 seconds
-- Resolution: 1920x1080
-- FPS: 30.0
-- Total Frames: 30
-
-### Analysis Statistics
-- Frames Analyzed: 30
-- Batches Processed: 5
-- Total Tokens Used: 8934
-- Extraction Time: 0.38 seconds
-- Analysis Time: 12.67 seconds
-
-### Summary
-Detected button state transition with color change, scale animation, and label update.
-
-### Detailed Frame Analysis
-**[0.00s - 0.20s]** (Frames 1-6)
-POSITION CHANGES:
-- Button container: No movement (centered at x=960, y=540)
-
-SIZE CHANGES:
-- Frame 1→2: Button scale 1.0 → 0.95 (press-down effect)
-- Frame 3→4: Button scale 0.95 → 1.0 (release)
-
-OPACITY/COLOR:
-- Frame 1: Button background #007AFF (blue)
-- Frame 2: Button background #0056B3 (darker blue - pressed state)
-- Frame 3: Button background #007AFF (returning to normal)
-
-**[0.20s - 0.40s]** (Frames 7-12)
-POSITION CHANGES:
-- Checkmark icon: Appears at center of button
-- Frame 7: Checkmark at scale 0
-- Frame 12: Checkmark at scale 1.0 (pop-in animation)
-
-VISIBILITY:
-- "Submit" label: Fades out (opacity 1.0 → 0.0)
-- Checkmark icon: Fades in (opacity 0.0 → 1.0)
-
-COLOR:
-- Frame 7→12: Button transitions #007AFF → #34C759 (blue to green)
-
-**[0.40s - 0.60s]** (Frames 13-18)
-STATE CHANGES:
-- Button now shows checkmark icon
-- Color stabilized at #34C759 (success green)
-- All animations complete
-
-MEASUREMENTS:
-- Total color transition: 6 frames (0.2s)
-- Checkmark scale animation: 5 frames (0.17s)
-- Label crossfade: 4 frames (0.13s)
+### Issues Summary
+| # | Category | Issue | Severity |
+|---|----------|-------|----------|
+| 1 | Animation | Dropped frame at 0.4s | Minor |
+| 2 | Accessibility | Contrast issue | Medium |
+| 3 | Accessibility | Small touch target | Medium |
 ```
 
 ---
@@ -509,16 +325,20 @@ MEASUREMENTS:
 
 ## Example Workflows
 
-### Testing an Animation in iOS Simulator
+### Comprehensive Analysis of iOS Simulator
 
 ```
-You: "Record the Simulator for 3 seconds and test the animation"
+You: "Record the Simulator for 2 seconds with high mode"
 
-Claude: [Calls record_simulator_and_analyze with mode=test_animation]
-        [Records at 60fps for 3 seconds]
-        [Extracts up to 180 frames]
-        [Sends to OpenAI in batches of 10]
-        [Returns detailed animation analysis]
+Claude: [Asks: "Which analysis mode?"]
+        - low: Fast overview (~$0.001)
+        - medium: Balanced detail (~$0.003)
+        - high: Comprehensive analysis (~$0.05+)
+You:    [Select "high"]
+Claude: [Calls record_simulator_and_analyze with mode=high]
+        [Records at 60fps for 2 seconds]
+        [Extracts up to 60 frames at 30fps]
+        [Returns comprehensive analysis: animations + bugs + accessibility]
 ```
 
 ### Quick Check of a Video File
@@ -526,7 +346,7 @@ Claude: [Calls record_simulator_and_analyze with mode=test_animation]
 ```
 You: "Give me a quick summary of /path/to/demo.mp4"
 
-Claude: [Calls analyze_video with mode=quick_look]
+Claude: [Calls analyze_video with mode=low]
         [Extracts 15 frames at 0.5fps]
         [Single API call with 8 images]
         [Returns brief summary]
@@ -535,14 +355,16 @@ Claude: [Calls analyze_video with mode=quick_look]
 ### Testing a Specific UI Component
 
 ```
-You: "Let me select a region to test for bugs"
+You: "Let me select a region to test"
 
 Claude: [Calls select_record_and_analyze]
         [Opens visual selector overlay]
 You:    [Drag to select the component area]
-Claude: [Records selected region for specified duration]
-        [Analyzes with find_bugs mode]
-        [Returns bug report]
+Claude: [Asks: "Which analysis mode?"]
+You:    [Select mode based on need]
+Claude: [Records selected region]
+        [Analyzes with chosen mode]
+        [Returns analysis report]
 ```
 
 ---

@@ -599,11 +599,12 @@ public actor ScreenRecorder {
       videoInput: videoInput!,
       adaptor: pixelBufferAdaptor!,
       onFirstFrame: { [weak self] in
-        // This runs on the DispatchQueue, use MainActor to safely check state
-        Task { @MainActor [weak self] in
+        // This runs on the DispatchQueue, hop to the actor's context
+        Task {
           guard let self = self else { return }
           // Only yield if we're still recording
-          if case .recording = self.state {
+          let currentState = await self.getState()
+          if case .recording = currentState {
             capturedContinuation.yield(.firstFrameCaptured)
           }
         }
@@ -635,6 +636,9 @@ public actor ScreenRecorder {
     }
 
     state = .stopping
+
+    // Stop accepting frames immediately to prevent late frames
+    streamOutput?.stopWriting()
 
     // Stop the stream
     try await stream?.stopCapture()
@@ -730,6 +734,10 @@ private class StreamOutput: NSObject, SCStreamOutput {
   private var hasNotifiedFirstFrame = false
   private let notificationLock = NSLock()
 
+  // Stop flag to prevent writing frames after stop is requested
+  private var isStopped = false
+  private let stoppedLock = NSLock()
+
   init(
     assetWriter: AVAssetWriter,
     videoInput: AVAssetWriterInput,
@@ -743,8 +751,22 @@ private class StreamOutput: NSObject, SCStreamOutput {
     super.init()
   }
 
+  /// Signal that recording should stop - no more frames will be written
+  func stopWriting() {
+    stoppedLock.lock()
+    isStopped = true
+    stoppedLock.unlock()
+  }
+
   func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
     guard type == .screen else { return }
+
+    // Check if stopped (thread-safe)
+    stoppedLock.lock()
+    let stopped = isStopped
+    stoppedLock.unlock()
+    guard !stopped else { return }
+
     guard assetWriter.status == .writing else { return }
     guard videoInput.isReadyForMoreMediaData else { return }
 
