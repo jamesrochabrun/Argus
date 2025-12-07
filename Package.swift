@@ -14,7 +14,7 @@ let package = Package(
   dependencies: [
     .package(url: "https://github.com/modelcontextprotocol/swift-sdk", from: "0.7.1"),
     .package(url: "https://github.com/apple/swift-argument-parser", from: "1.3.0"),
-    .package(path: "/Users/jamesrochabrun/Desktop/git/SwiftOpenAI"),
+    .package(url: "https://github.com/jamesrochabrun/SwiftOpenAI", exact: "4.4.5"),
   ],
   targets: [
     .executableTarget(
