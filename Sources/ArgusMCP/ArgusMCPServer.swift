@@ -341,7 +341,16 @@ struct ArgusMCPServer: AsyncParsableCommand {
     version: "1.0.0"
   )
 
+  @Flag(name: .long, help: "Configure Claude Code to use Argus MCP server")
+  var setup = false
+
   mutating func run() async throws {
+    // Handle --setup flag
+    if setup {
+      try runSetup()
+      return
+    }
+
     // Get API key from environment
     guard let apiKey = ProcessInfo.processInfo.environment["OPENAI_API_KEY"] else {
       FileHandle.standardError.write("Error: OPENAI_API_KEY environment variable not set\n".data(using: .utf8)!)
@@ -1130,6 +1139,95 @@ func formatAnalysisResult(
       """
     }.joined(separator: "\n\n"))
     """
+}
+
+// MARK: - Setup Command
+
+/// Configures Claude Code to use Argus MCP server
+func runSetup() throws {
+  let claudeConfigPath = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent(".claude.json")
+
+  // Get the path to this executable
+  let executablePath = ProcessInfo.processInfo.arguments[0]
+  let resolvedPath: String
+
+  // Resolve to absolute path if needed
+  if executablePath.hasPrefix("/") {
+    resolvedPath = executablePath
+  } else {
+    let currentDir = FileManager.default.currentDirectoryPath
+    resolvedPath = (currentDir as NSString).appendingPathComponent(executablePath)
+  }
+
+  print("Argus MCP Setup")
+  print("===============")
+  print("")
+  print("Executable path: \(resolvedPath)")
+  print("Claude config: \(claudeConfigPath.path)")
+  print("")
+
+  // Check if config exists
+  var config: [String: Any] = [:]
+  if FileManager.default.fileExists(atPath: claudeConfigPath.path) {
+    if let data = try? Data(contentsOf: claudeConfigPath),
+       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+      config = json
+      print("Found existing ~/.claude.json")
+    }
+  } else {
+    print("No existing ~/.claude.json found, will create one")
+  }
+
+  // Get or create mcpServers
+  var mcpServers = config["mcpServers"] as? [String: Any] ?? [:]
+
+  // Check if argus already configured
+  if mcpServers["argus"] != nil {
+    print("")
+    print("Argus is already configured in ~/.claude.json")
+    print("Current configuration will be updated.")
+  }
+
+  // Create argus config
+  let argusConfig: [String: Any] = [
+    "type": "stdio",
+    "command": resolvedPath,
+    "env": [
+      "OPENAI_API_KEY": ProcessInfo.processInfo.environment["OPENAI_API_KEY"] ?? "YOUR_OPENAI_API_KEY"
+    ]
+  ]
+
+  mcpServers["argus"] = argusConfig
+  config["mcpServers"] = mcpServers
+
+  // Write config
+  let jsonData = try JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted, .sortedKeys])
+  try jsonData.write(to: claudeConfigPath)
+
+  print("")
+  print("Configuration written to ~/.claude.json")
+  print("")
+
+  // Check API key
+  if ProcessInfo.processInfo.environment["OPENAI_API_KEY"] == nil {
+    print("WARNING: OPENAI_API_KEY environment variable not set!")
+    print("")
+    print("You need to edit ~/.claude.json and replace YOUR_OPENAI_API_KEY")
+    print("with your actual OpenAI API key.")
+    print("")
+    print("Get your API key at: https://platform.openai.com/api-keys")
+  } else {
+    print("OpenAI API key detected from environment.")
+  }
+
+  print("")
+  print("Setup complete! Restart Claude Code to use Argus.")
+  print("")
+  print("Available tools:")
+  print("  - record_and_analyze: Record screen and analyze")
+  print("  - select_record_and_analyze: Record selected region")
+  print("  - analyze_video: Analyze existing video file")
 }
 
 // MARK: - Errors
