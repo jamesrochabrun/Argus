@@ -8,16 +8,14 @@ on:
 jobs:
   build:
     name: Build and Release
-    runs-on: macos-14  # Apple Silicon runner for faster builds
+    runs-on: macos-15  # macOS 15 has Xcode 16 with Swift 6
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Swift
-        uses: swift-actions/setup-swift@v2
-        with:
-          swift-version: '6.0'
+      - name: Verify Swift version
+        run: swift --version
 
       - name: Build universal binary
         run: |
