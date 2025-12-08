@@ -35,7 +35,7 @@ final class RecordingSession {
           case .stopClicked, .timeout:
             await onStopRequested()
             return
-          case .ready, .processExited:
+          case .ready, .processExited, .cancelClicked:
             break
           }
         }
@@ -172,6 +172,23 @@ enum AnalysisMode: String {
   }
 }
 
+// MARK: - Analysis Cancellation
+
+/// Error thrown when analysis is cancelled by user
+enum AnalysisCancellationError: Error, LocalizedError {
+  case cancelledByUser
+
+  var errorDescription: String? {
+    "Analysis cancelled by user. No results available."
+  }
+}
+
+/// Result of a recording session
+struct RecordingResult {
+  let url: URL
+  let statusUI: RecordingStatusUI?
+}
+
 // MARK: - Recording Orchestrator
 
 /// Orchestrates screen recording with UI feedback and duration handling
@@ -185,12 +202,12 @@ enum RecordingOrchestrator {
   ///   - eventStream: The recording event stream from ScreenRecorder
   ///   - durationSeconds: nil = manual mode (user clicks Stop, max 30s), Int = timed mode (capped at 30s)
   ///   - screenRecorder: The screen recorder instance
-  /// - Returns: Tuple of the recorded video URL and the status UI (for finalization after analysis)
+  /// - Returns: RecordingResult containing URL, status UI, and event stream for cancel monitoring
   static func performRecording(
     eventStream: AsyncStream<ScreenRecorder.RecordingEvent>,
     durationSeconds: Int?,
     screenRecorder: ScreenRecorder
-  ) async throws -> (url: URL, statusUI: RecordingStatusUI?) {
+  ) async throws -> RecordingResult {
     // Cap duration at max
     let effectiveDuration: Int? = durationSeconds.map { min($0, maxDuration) }
 
@@ -236,7 +253,8 @@ enum RecordingOrchestrator {
                 case .stopClicked, .timeout:
                   _ = try? await screenRecorder.stopRecording()
                   return
-                case .ready, .processExited:
+                case .ready, .processExited, .cancelClicked:
+                  // cancelClicked shouldn't happen during recording, ignore
                   break
                 }
               }
@@ -279,7 +297,83 @@ enum RecordingOrchestrator {
       throw ToolError.invalidArgument("Recording failed - no output URL")
     }
 
-    return (url: finalURL, statusUI: statusUI)
+    return RecordingResult(url: finalURL, statusUI: statusUI)
+  }
+
+  /// Performs analysis with cancellation support
+  /// - Parameters:
+  ///   - videoURL: URL of the recorded video
+  ///   - mode: Analysis mode
+  ///   - context: Context description for the prompt
+  ///   - customPrompt: Optional custom prompt
+  ///   - effectiveDuration: Recording duration
+  ///   - frameExtractor: Frame extractor instance
+  ///   - videoAnalyzer: Video analyzer instance
+  ///   - statusUI: Status UI for showing success/error and getting fresh event stream
+  /// - Returns: Analysis result or throws if cancelled/failed
+  static func performAnalysisWithCancellation(
+    videoURL: URL,
+    mode: AnalysisMode,
+    context: String,
+    customPrompt: String?,
+    effectiveDuration: Int,
+    frameExtractor: VideoFrameExtractor,
+    videoAnalyzer: VideoAnalyzer,
+    statusUI: RecordingStatusUI?
+  ) async throws -> (extraction: VideoFrameExtractor.ExtractionResult, analysis: VideoAnalyzer.VideoAnalysisResult) {
+    // Get a fresh event stream from the status UI for analysis phase
+    // This is needed because the recording phase consumes/exhausts the original stream
+    let uiEventStream = await statusUI?.getAnalysisEventStream()
+
+    // If no UI event stream, just run analysis directly
+    guard let uiEventStream = uiEventStream else {
+      return try await analyzeVideo(
+        url: videoURL,
+        mode: mode,
+        context: context,
+        customPrompt: customPrompt,
+        effectiveDuration: effectiveDuration,
+        frameExtractor: frameExtractor,
+        videoAnalyzer: videoAnalyzer
+      )
+    }
+
+    // Run analysis with cancellation monitoring
+    return try await withThrowingTaskGroup(of: (VideoFrameExtractor.ExtractionResult, VideoAnalyzer.VideoAnalysisResult)?.self) { group in
+      // Analysis task
+      group.addTask {
+        try await analyzeVideo(
+          url: videoURL,
+          mode: mode,
+          context: context,
+          customPrompt: customPrompt,
+          effectiveDuration: effectiveDuration,
+          frameExtractor: frameExtractor,
+          videoAnalyzer: videoAnalyzer
+        )
+      }
+
+      // Cancel monitor task
+      group.addTask {
+        for await event in uiEventStream {
+          if case .cancelClicked = event {
+            throw AnalysisCancellationError.cancelledByUser
+          }
+        }
+        return nil // Stream ended without cancel
+      }
+
+      // Wait for first result
+      while let result = try await group.next() {
+        if let analysisResult = result {
+          group.cancelAll()
+          return analysisResult
+        }
+      }
+
+      // Should not reach here
+      throw ToolError.invalidArgument("Analysis failed unexpectedly")
+    }
   }
 
   /// Completes analysis and shows success/error in UI, then terminates
@@ -728,53 +822,57 @@ func handleRecordAndAnalyze(
 
   // Start recording
   let eventStream = try await screenRecorder.startRecordingWithEvents()
-  let (videoURL, statusUI) = try await RecordingOrchestrator.performRecording(
+  let recordingResult = try await RecordingOrchestrator.performRecording(
     eventStream: eventStream,
     durationSeconds: durationSeconds,
     screenRecorder: screenRecorder
   )
 
-  // Analyze video
-  var analysisSucceeded = false
-  var extraction: VideoFrameExtractor.ExtractionResult?
-  var analysis: VideoAnalyzer.VideoAnalysisResult?
-
+  // Analyze video with cancellation support
   do {
-    let result = try await analyzeVideo(
-      url: videoURL,
+    let result = try await RecordingOrchestrator.performAnalysisWithCancellation(
+      videoURL: recordingResult.url,
       mode: mode,
       context: "screen recording",
       customPrompt: arguments["custom_prompt"]?.stringValue,
       effectiveDuration: effectiveDuration,
       frameExtractor: frameExtractor,
-      videoAnalyzer: videoAnalyzer
+      videoAnalyzer: videoAnalyzer,
+      statusUI: recordingResult.statusUI
     )
-    extraction = result.extraction
-    analysis = result.analysis
-    analysisSucceeded = true
+
+    // Finalize UI with success
+    if let statusUI = recordingResult.statusUI {
+      await RecordingOrchestrator.finalizeWithUI(success: true, statusUI: statusUI)
+    }
+
+    let durationText = durationSeconds.map { "\($0) seconds" } ?? "manual (user stopped)"
+
+    return """
+      Recording completed and analyzed.
+      Video file: \(recordingResult.url.path)
+      Duration: \(durationText)
+
+      \(formatAnalysisResult(extraction: result.extraction, analysis: result.analysis))
+      """
+  } catch let error as AnalysisCancellationError {
+    // User cancelled - show cancelled state in UI briefly, then dismiss
+    // Do this in background so we can return to Claude Code immediately
+    if let statusUI = recordingResult.statusUI {
+      Task {
+        await statusUI.notifyCancelled()
+        try? await Task.sleep(for: .seconds(1))
+        await MainActor.run { statusUI.terminate() }
+      }
+    }
+    return error.localizedDescription
   } catch {
-    analysisSucceeded = false
+    // Analysis failed - show error in UI
+    if let statusUI = recordingResult.statusUI {
+      await RecordingOrchestrator.finalizeWithUI(success: false, statusUI: statusUI)
+    }
+    throw ToolError.invalidArgument("Video analysis failed: \(error.localizedDescription)")
   }
-
-  // Finalize UI
-  if let statusUI = statusUI {
-    await RecordingOrchestrator.finalizeWithUI(success: analysisSucceeded, statusUI: statusUI)
-  }
-
-  // Re-throw if analysis failed
-  guard analysisSucceeded, let extraction = extraction, let analysis = analysis else {
-    throw ToolError.invalidArgument("Video analysis failed")
-  }
-
-  let durationText = durationSeconds.map { "\($0) seconds" } ?? "manual (user stopped)"
-
-  return """
-    Recording completed and analyzed.
-    Video file: \(videoURL.path)
-    Duration: \(durationText)
-
-    \(formatAnalysisResult(extraction: extraction, analysis: analysis))
-    """
 }
 
 // MARK: - App Recording Handlers
@@ -806,54 +904,58 @@ func handleRecordSimulatorAndAnalyze(
     config: recordingConfig,
     outputPath: nil
   )
-  let (videoURL, statusUI) = try await RecordingOrchestrator.performRecording(
+  let recordingResult = try await RecordingOrchestrator.performRecording(
     eventStream: eventStream,
     durationSeconds: durationSeconds,
     screenRecorder: screenRecorder
   )
 
-  // Analyze video
-  var analysisSucceeded = false
-  var extraction: VideoFrameExtractor.ExtractionResult?
-  var analysis: VideoAnalyzer.VideoAnalysisResult?
-
+  // Analyze video with cancellation support
   do {
-    let result = try await analyzeVideo(
-      url: videoURL,
+    let result = try await RecordingOrchestrator.performAnalysisWithCancellation(
+      videoURL: recordingResult.url,
       mode: mode,
       context: "iOS Simulator recording",
       customPrompt: arguments["custom_prompt"]?.stringValue,
       effectiveDuration: effectiveDuration,
       frameExtractor: frameExtractor,
-      videoAnalyzer: videoAnalyzer
+      videoAnalyzer: videoAnalyzer,
+      statusUI: recordingResult.statusUI
     )
-    extraction = result.extraction
-    analysis = result.analysis
-    analysisSucceeded = true
+
+    // Finalize UI with success
+    if let statusUI = recordingResult.statusUI {
+      await RecordingOrchestrator.finalizeWithUI(success: true, statusUI: statusUI)
+    }
+
+    let durationText = durationSeconds.map { "\($0) seconds" } ?? "manual (user stopped)"
+
+    return """
+      iOS Simulator recording completed and analyzed.
+      Video file: \(recordingResult.url.path)
+      Duration: \(durationText)
+      Analysis mode: \(mode.rawValue)
+
+      \(formatAnalysisResult(extraction: result.extraction, analysis: result.analysis))
+      """
+  } catch let error as AnalysisCancellationError {
+    // User cancelled - show cancelled state in UI briefly, then dismiss
+    // Do this in background so we can return to Claude Code immediately
+    if let statusUI = recordingResult.statusUI {
+      Task {
+        await statusUI.notifyCancelled()
+        try? await Task.sleep(for: .seconds(1))
+        await MainActor.run { statusUI.terminate() }
+      }
+    }
+    return error.localizedDescription
   } catch {
-    analysisSucceeded = false
+    // Analysis failed - show error in UI
+    if let statusUI = recordingResult.statusUI {
+      await RecordingOrchestrator.finalizeWithUI(success: false, statusUI: statusUI)
+    }
+    throw ToolError.invalidArgument("Video analysis failed: \(error.localizedDescription)")
   }
-
-  // Finalize UI
-  if let statusUI = statusUI {
-    await RecordingOrchestrator.finalizeWithUI(success: analysisSucceeded, statusUI: statusUI)
-  }
-
-  // Re-throw if analysis failed
-  guard analysisSucceeded, let extraction = extraction, let analysis = analysis else {
-    throw ToolError.invalidArgument("Video analysis failed")
-  }
-
-  let durationText = durationSeconds.map { "\($0) seconds" } ?? "manual (user stopped)"
-
-  return """
-    iOS Simulator recording completed and analyzed.
-    Video file: \(videoURL.path)
-    Duration: \(durationText)
-    Analysis mode: \(mode.rawValue)
-
-    \(formatAnalysisResult(extraction: extraction, analysis: analysis))
-    """
 }
 
 func handleRecordAppAndAnalyze(
@@ -887,54 +989,58 @@ func handleRecordAppAndAnalyze(
     config: recordingConfig,
     outputPath: nil
   )
-  let (videoURL, statusUI) = try await RecordingOrchestrator.performRecording(
+  let recordingResult = try await RecordingOrchestrator.performRecording(
     eventStream: eventStream,
     durationSeconds: durationSeconds,
     screenRecorder: screenRecorder
   )
 
-  // Analyze video
-  var analysisSucceeded = false
-  var extraction: VideoFrameExtractor.ExtractionResult?
-  var analysis: VideoAnalyzer.VideoAnalysisResult?
-
+  // Analyze video with cancellation support
   do {
-    let result = try await analyzeVideo(
-      url: videoURL,
+    let result = try await RecordingOrchestrator.performAnalysisWithCancellation(
+      videoURL: recordingResult.url,
       mode: mode,
       context: "'\(appName)' recording",
       customPrompt: arguments["custom_prompt"]?.stringValue,
       effectiveDuration: effectiveDuration,
       frameExtractor: frameExtractor,
-      videoAnalyzer: videoAnalyzer
+      videoAnalyzer: videoAnalyzer,
+      statusUI: recordingResult.statusUI
     )
-    extraction = result.extraction
-    analysis = result.analysis
-    analysisSucceeded = true
+
+    // Finalize UI with success
+    if let statusUI = recordingResult.statusUI {
+      await RecordingOrchestrator.finalizeWithUI(success: true, statusUI: statusUI)
+    }
+
+    let durationText = durationSeconds.map { "\($0) seconds" } ?? "manual (user stopped)"
+
+    return """
+      '\(appName)' recording completed and analyzed.
+      Video file: \(recordingResult.url.path)
+      Duration: \(durationText)
+      Analysis mode: \(mode.rawValue)
+
+      \(formatAnalysisResult(extraction: result.extraction, analysis: result.analysis))
+      """
+  } catch let error as AnalysisCancellationError {
+    // User cancelled - show cancelled state in UI briefly, then dismiss
+    // Do this in background so we can return to Claude Code immediately
+    if let statusUI = recordingResult.statusUI {
+      Task {
+        await statusUI.notifyCancelled()
+        try? await Task.sleep(for: .seconds(1))
+        await MainActor.run { statusUI.terminate() }
+      }
+    }
+    return error.localizedDescription
   } catch {
-    analysisSucceeded = false
+    // Analysis failed - show error in UI
+    if let statusUI = recordingResult.statusUI {
+      await RecordingOrchestrator.finalizeWithUI(success: false, statusUI: statusUI)
+    }
+    throw ToolError.invalidArgument("Video analysis failed: \(error.localizedDescription)")
   }
-
-  // Finalize UI
-  if let statusUI = statusUI {
-    await RecordingOrchestrator.finalizeWithUI(success: analysisSucceeded, statusUI: statusUI)
-  }
-
-  // Re-throw if analysis failed
-  guard analysisSucceeded, let extraction = extraction, let analysis = analysis else {
-    throw ToolError.invalidArgument("Video analysis failed")
-  }
-
-  let durationText = durationSeconds.map { "\($0) seconds" } ?? "manual (user stopped)"
-
-  return """
-    '\(appName)' recording completed and analyzed.
-    Video file: \(videoURL.path)
-    Duration: \(durationText)
-    Analysis mode: \(mode.rawValue)
-
-    \(formatAnalysisResult(extraction: extraction, analysis: analysis))
-    """
 }
 
 // MARK: - Region Selection Handlers
@@ -1054,56 +1160,60 @@ func handleSelectRecordAndAnalyze(
     config: recordingConfig,
     outputPath: nil
   )
-  let (videoURL, statusUI) = try await RecordingOrchestrator.performRecording(
+  let recordingResult = try await RecordingOrchestrator.performRecording(
     eventStream: eventStream,
     durationSeconds: durationSeconds,
     screenRecorder: screenRecorder
   )
 
-  // Analyze video
-  var analysisSucceeded = false
-  var extraction: VideoFrameExtractor.ExtractionResult?
-  var analysis: VideoAnalyzer.VideoAnalysisResult?
-
+  // Analyze video with cancellation support
   do {
-    let result = try await analyzeVideo(
-      url: videoURL,
+    let result = try await RecordingOrchestrator.performAnalysisWithCancellation(
+      videoURL: recordingResult.url,
       mode: mode,
       context: "screen recording",
       customPrompt: arguments["custom_prompt"]?.stringValue,
       effectiveDuration: effectiveDuration,
       frameExtractor: frameExtractor,
-      videoAnalyzer: videoAnalyzer
+      videoAnalyzer: videoAnalyzer,
+      statusUI: recordingResult.statusUI
     )
-    extraction = result.extraction
-    analysis = result.analysis
-    analysisSucceeded = true
+
+    // Finalize UI with success
+    if let statusUI = recordingResult.statusUI {
+      await RecordingOrchestrator.finalizeWithUI(success: true, statusUI: statusUI)
+    }
+
+    let durationText = durationSeconds.map { "\($0) seconds" } ?? "manual (user stopped)"
+
+    return """
+      Screen region recording completed and analyzed!
+
+      Selected region: \(selection.x), \(selection.y) - \(selection.width)x\(selection.height)
+      Video file: \(recordingResult.url.path)
+      Duration: \(durationText)
+      Analysis mode: \(mode.rawValue)
+
+      \(formatAnalysisResult(extraction: result.extraction, analysis: result.analysis))
+      """
+  } catch let error as AnalysisCancellationError {
+    // User cancelled - show cancelled state in UI briefly, then dismiss
+    // Do this in background so we can return to Claude Code immediately
+    if let statusUI = recordingResult.statusUI {
+      Task {
+        await statusUI.notifyCancelled()
+        try? await Task.sleep(for: .seconds(1))
+        await MainActor.run { statusUI.terminate() }
+      }
+    }
+    return error.localizedDescription
   } catch {
-    analysisSucceeded = false
+    // Analysis failed - show error in UI
+    if let statusUI = recordingResult.statusUI {
+      await RecordingOrchestrator.finalizeWithUI(success: false, statusUI: statusUI)
+    }
+    throw ToolError.invalidArgument("Video analysis failed: \(error.localizedDescription)")
   }
-
-  // Finalize UI
-  if let statusUI = statusUI {
-    await RecordingOrchestrator.finalizeWithUI(success: analysisSucceeded, statusUI: statusUI)
-  }
-
-  // Re-throw if analysis failed
-  guard analysisSucceeded, let extraction = extraction, let analysis = analysis else {
-    throw ToolError.invalidArgument("Video analysis failed")
-  }
-
-  let durationText = durationSeconds.map { "\($0) seconds" } ?? "manual (user stopped)"
-
-  return """
-    Screen region recording completed and analyzed!
-
-    Selected region: \(selection.x), \(selection.y) - \(selection.width)x\(selection.height)
-    Video file: \(videoURL.path)
-    Duration: \(durationText)
-    Analysis mode: \(mode.rawValue)
-
-    \(formatAnalysisResult(extraction: extraction, analysis: analysis))
-    """
 }
 
 // MARK: - Helper Functions
