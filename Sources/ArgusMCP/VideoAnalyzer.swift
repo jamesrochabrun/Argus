@@ -124,6 +124,9 @@ public final class VideoAnalyzer: @unchecked Sendable {
     var totalTokensUsed = 0
 
     for (batchIndex, batch) in batches.enumerated() {
+      // Check for cancellation before each batch
+      try Task.checkCancellation()
+
       let result = try await analyzeBatch(
         batch: batch,
         batchIndex: batchIndex,
@@ -136,6 +139,9 @@ public final class VideoAnalyzer: @unchecked Sendable {
       let progress = Double(batchIndex + 1) / Double(batches.count)
       progressHandler?(progress * 0.9, "Processed \(batchIndex + 1)/\(batches.count) batches")
     }
+
+    // Check for cancellation before summary generation
+    try Task.checkCancellation()
 
     // Generate summary from all batch analyses
     progressHandler?(0.95, "Generating summary...")

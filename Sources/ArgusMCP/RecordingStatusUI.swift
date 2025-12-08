@@ -11,6 +11,7 @@ struct StatusCommand: Codable {
     case analyzing   // Show analyzing spinner
     case success     // Show success checkmark (brief)
     case error       // Show error state (brief)
+    case cancelled   // Show cancelled state (brief)
   }
 
   let type: CommandType
@@ -20,9 +21,10 @@ struct StatusCommand: Codable {
 /// Responses received from UI process via stdout
 struct StatusResponse: Codable {
   enum ResponseType: String, Codable {
-    case ready       // UI is displayed and ready
-    case stopClicked // User clicked stop button
-    case timeout     // Max duration (30s) reached
+    case ready         // UI is displayed and ready
+    case stopClicked   // User clicked stop button
+    case timeout       // Max duration (30s) reached
+    case cancelClicked // User clicked cancel button during analysis
   }
 
   let type: ResponseType
@@ -39,6 +41,7 @@ public final class RecordingStatusUI {
     case ready         // UI is displayed
     case stopClicked   // User clicked Stop button
     case timeout       // Max duration reached
+    case cancelClicked // User clicked Cancel button during analysis
     case processExited // UI process terminated
   }
 
@@ -55,6 +58,7 @@ public final class RecordingStatusUI {
   private var inputPipe: Pipe?
   private var outputPipe: Pipe?
   private var eventContinuation: AsyncStream<UIEvent>.Continuation?
+  private var analysisContinuation: AsyncStream<UIEvent>.Continuation?
   private var isRunning = false
 
   public init() {}
@@ -134,6 +138,20 @@ public final class RecordingStatusUI {
     try? await sendCommand(command)
   }
 
+  /// Notify UI to show cancelled state
+  public func notifyCancelled() async {
+    let command = StatusCommand(type: .cancelled, durationSeconds: nil)
+    try? await sendCommand(command)
+  }
+
+  /// Get a fresh event stream for analysis phase
+  /// This creates a new continuation that will receive cancelClicked events
+  public func getAnalysisEventStream() -> AsyncStream<UIEvent> {
+    let (stream, continuation) = AsyncStream<UIEvent>.makeStream()
+    self.analysisContinuation = continuation
+    return stream
+  }
+
   /// Terminate the UI process
   public func terminate() {
     guard isRunning else { return }
@@ -146,6 +164,8 @@ public final class RecordingStatusUI {
 
     eventContinuation?.finish()
     eventContinuation = nil
+    analysisContinuation?.finish()
+    analysisContinuation = nil
   }
 
   // MARK: - Private
@@ -243,6 +263,10 @@ public final class RecordingStatusUI {
               self?.eventContinuation?.yield(.stopClicked)
             case .timeout:
               self?.eventContinuation?.yield(.timeout)
+            case .cancelClicked:
+              // Yield to BOTH continuations so analysis phase can receive cancel events
+              self?.eventContinuation?.yield(.cancelClicked)
+              self?.analysisContinuation?.yield(.cancelClicked)
             }
           }
         }

@@ -12,6 +12,7 @@ struct StatusCommand: Codable {
     case analyzing   // Show analyzing spinner
     case success     // Show success checkmark
     case error       // Show error state
+    case cancelled   // Show cancelled state briefly
   }
 
   let type: CommandType
@@ -21,9 +22,10 @@ struct StatusCommand: Codable {
 /// Responses sent to MCP server via stdout
 struct StatusResponse: Codable {
   enum ResponseType: String, Codable {
-    case ready       // UI is displayed and ready
-    case stopClicked // User clicked stop button
-    case timeout     // Max duration (30s) reached
+    case ready         // UI is displayed and ready
+    case stopClicked   // User clicked stop button
+    case timeout       // Max duration (30s) reached
+    case cancelClicked // User clicked cancel button during analysis
   }
 
   let type: ResponseType
@@ -37,6 +39,7 @@ enum RecordingState: Equatable {
   case analyzing
   case success
   case error
+  case cancelled
 }
 
 // MARK: - State Manager
@@ -54,6 +57,7 @@ class RecordingStateManager: ObservableObject {
 
   var onStopClicked: (() -> Void)?
   var onTimeout: (() -> Void)?
+  var onCancelClicked: (() -> Void)?
 
   var timerText: String {
     let displaySeconds: Int
@@ -92,6 +96,10 @@ class RecordingStateManager: ObservableObject {
 
   func setError() {
     state = .error
+  }
+
+  func setCancelled() {
+    state = .cancelled
   }
 
   func stop() {
@@ -137,6 +145,10 @@ class RecordingStateManager: ObservableObject {
 
   func handleStopClicked() {
     onStopClicked?()
+  }
+
+  func handleCancelClicked() {
+    onCancelClicked?()
   }
 }
 
@@ -240,6 +252,22 @@ struct RecordingStatusView: View {
           }
           .buttonStyle(.plain)
         }
+
+        // Cancel button (during analyzing/error states)
+        if stateManager.state == .analyzing || stateManager.state == .error {
+          Button(action: {
+            stateManager.handleCancelClicked()
+          }) {
+            Text("Cancel")
+              .font(.system(size: 13, weight: .medium))
+              .foregroundStyle(.white)
+              .padding(.horizontal, 14)
+              .padding(.vertical, 6)
+              .background(Color.orange.opacity(0.8))
+              .clipShape(RoundedRectangle(cornerRadius: 8))
+          }
+          .buttonStyle(.plain)
+        }
       }
       .padding(.horizontal, 16)
       .padding(.vertical, 12)
@@ -301,6 +329,12 @@ struct RecordingStatusView: View {
         .font(.system(size: 18, weight: .medium))
         .foregroundStyle(.red)
         .transition(.scale.combined(with: .opacity))
+
+    case .cancelled:
+      Image(systemName: "xmark.circle.fill")
+        .font(.system(size: 18, weight: .medium))
+        .foregroundStyle(.orange)
+        .transition(.scale.combined(with: .opacity))
     }
   }
 
@@ -324,6 +358,8 @@ struct RecordingStatusView: View {
       return "Complete"
     case .error:
       return "Error"
+    case .cancelled:
+      return "Cancelled"
     }
   }
 }
@@ -378,6 +414,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     stateManager.onTimeout = { [weak self] in
       self?.sendResponse(.timeout)
+    }
+
+    stateManager.onCancelClicked = { [weak self] in
+      self?.sendResponse(.cancelClicked)
     }
 
     // Signal ready and start reading input
@@ -444,6 +484,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     case .stop:
       stateManager.stop()
+
+    case .cancelled:
+      stateManager.setCancelled()
     }
   }
 
