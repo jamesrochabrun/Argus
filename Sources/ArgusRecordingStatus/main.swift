@@ -290,15 +290,9 @@ struct RecordingStatusView: View {
 
   @ViewBuilder
   private func glassBackground() -> some View {
-    if #available(macOS 26, *) {
-      // Liquid Glass on macOS 26+
-      RoundedRectangle(cornerRadius: 16)
-        .fill(.ultraThinMaterial)
-        .glassEffect(.regular)
-    } else {
-      // Fallback to NSVisualEffectView
-      VisualEffectBlur(material: .hudWindow, blendingMode: .behindWindow)
-    }
+    // Use NSVisualEffectView for blur effect
+    // Note: .glassEffect(.regular) requires macOS 26+ SDK which isn't available in CI yet
+    VisualEffectBlur(material: .hudWindow, blendingMode: .behindWindow)
   }
 
   @ViewBuilder
