@@ -1,6 +1,6 @@
 import AVFoundation
 import Foundation
-import ScreenCaptureKit
+@preconcurrency import ScreenCaptureKit
 
 /// Screen recorder using ScreenCaptureKit for macOS
 /// Captures screen content and saves to video file
