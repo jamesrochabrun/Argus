@@ -1,42 +1,77 @@
-# Argus 
+# Argus
 
 <img width="2058" height="830" alt="Image" src="https://github.com/user-attachments/assets/8fd7f2fe-612a-42eb-b97e-7e54869cd383" />
 
 A MCP (Model Context Protocol) server for video analysis using OpenAI's Vision API. Argus extracts frames from videos and analyzes them.
 
-## Requirements
-
-- macOS 14.0+
-- Swift 6.0+
-- OpenAI API key
-
-## Local Setup
+## Quick Install
 
 ```bash
-# Clone
-git clone https://github.com/jamesrochabrun/Argus.git
-cd Argus
-
-# Build
-swift build
+curl -fsSL https://raw.githubusercontent.com/jamesrochabrun/Argus/main/install.sh | sh
 ```
 
-The binaries will be at:
-- `.build/debug/argus-mcp` - Main MCP server
-- `.build/debug/argus-select` - Visual region selector
+This downloads the latest release and shows configuration instructions.
 
-### Configure Claude Code
+### After Installing
 
-Add to `~/.claude.json` under the `mcpServers` key:
+Add to `~/.claude.json`:
 
 ```json
 {
   "mcpServers": {
     "argus": {
       "type": "stdio",
-      "command": "/path/to/Argus/.build/debug/argus-mcp",
+      "command": "~/.local/bin/argus-mcp",
       "env": {
-        "OPENAI_API_KEY": "sk-your-openai-api-key"
+        "OPENAI_API_KEY": "your-openai-api-key"
+      }
+    }
+  }
+}
+```
+
+Get your API key at: https://platform.openai.com/api-keys
+
+Restart Claude Code to use Argus.
+
+---
+
+## Requirements
+
+- macOS 14.0+
+- OpenAI API key
+
+## Build from Source
+
+For contributors or if you prefer building locally:
+
+```bash
+git clone https://github.com/jamesrochabrun/Argus.git
+cd Argus
+swift build -c release
+
+# Auto-configure Claude Code (optional)
+.build/release/argus-mcp --setup
+```
+
+The `--setup` flag automatically updates `~/.claude.json` with the correct paths.
+
+### Manual Configuration
+
+If you prefer manual setup, binaries are at:
+- `.build/release/argus-mcp` - Main MCP server
+- `.build/release/argus-select` - Visual region selector
+
+Add to `~/.claude.json`:
+
+```json
+{
+  "mcpServers": {
+    "argus": {
+      "type": "stdio",
+      "command": "/absolute/path/to/Argus/.build/release/argus-mcp",
+      "env": {
+        "OPENAI_API_KEY": "your-openai-api-key"
       }
     }
   }

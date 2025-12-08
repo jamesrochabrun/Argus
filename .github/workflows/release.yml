@@ -1,0 +1,43 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build and Release
+    runs-on: macos-14  # Apple Silicon runner for faster builds
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Swift
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: '5.9'
+
+      - name: Build universal binary
+        run: |
+          swift build -c release --arch arm64 --arch x86_64
+
+      - name: Prepare release artifacts
+        run: |
+          mkdir -p release-artifacts
+          cp .build/apple/Products/Release/argus-mcp release-artifacts/
+          cp .build/apple/Products/Release/argus-select release-artifacts/
+          cd release-artifacts
+          tar -czvf argus-macos-universal.tar.gz argus-mcp argus-select
+          shasum -a 256 argus-macos-universal.tar.gz > argus-macos-universal.tar.gz.sha256
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-artifacts/argus-macos-universal.tar.gz
+            release-artifacts/argus-macos-universal.tar.gz.sha256
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
