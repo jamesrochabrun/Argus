@@ -1,4 +1,5 @@
 import ArgumentParser
+import AVFoundation
 import Foundation
 import MCP
 import SwiftOpenAI
@@ -35,7 +36,7 @@ final class RecordingSession {
           case .stopClicked, .timeout:
             await onStopRequested()
             return
-          case .ready, .processExited:
+          case .ready, .processExited, .cancelClicked:
             break
           }
         }
@@ -64,7 +65,7 @@ final class RecordingSession {
 // MARK: - Model Configuration
 
 /// Default model for video analysis - change this to swap models globally
-public let defaultVisionModel = "gpt-5-nano"
+public let defaultVisionModel = "gpt-4o-mini"
 
 // MARK: - Analysis Mode Configuration
 
@@ -73,6 +74,16 @@ enum AnalysisMode: String {
   case low
   case auto
   case high
+
+  /// Maximum recording duration in seconds for this mode
+  var maxDuration: Int {
+    switch self {
+    case .low, .auto:
+      return 30  // Full 30 seconds for low/auto modes
+    case .high:
+      return 5   // Limited to ~5 seconds for high mode (120 frames at 30fps)
+    }
+  }
 
   /// Returns analysis and extraction configs for the given mode
   /// - Parameters:
@@ -89,13 +100,13 @@ enum AnalysisMode: String {
           batchSize: 8,
           model: defaultVisionModel,
           maxTokensPerBatch: 500,
-          systemPrompt: "Provide a quick, concise summary of what happens in this \(context). Focus on the main content and key moments.",
+          systemPrompt: "Provide a quick, concise summary of what happens in this \(context). Focus on the main content, key actions, and notable moments.",
           imageDetail: "low",
           temperature: 0.3
         ),
         extraction: VideoFrameExtractor.ExtractionConfig(
-          framesPerSecond: 0.5,
-          maxFrames: 15,
+          framesPerSecond: 2.0,
+          maxFrames: 60,
           targetWidth: 512,
           compressionQuality: 0.7
         )
@@ -108,19 +119,19 @@ enum AnalysisMode: String {
           model: defaultVisionModel,
           maxTokensPerBatch: 1500,
           systemPrompt: """
-            Explain in detail what happens in this \(context). Describe:
-            1. The overall content and context
-            2. Step-by-step actions and events
-            3. Important UI elements, text, and visual information
-            4. The purpose and outcome of what's shown
-            Be thorough and educational in your explanation.
+            Analyze this \(context) in detail. Describe:
+            1. The overall content, setting, and context
+            2. Key actions, events, and transitions as they occur
+            3. Important visual elements, text, and information displayed
+            4. The purpose and outcome of what's being shown
+            Be thorough and clear in your explanation.
             """,
           imageDetail: "auto",
           temperature: 0.3
         ),
         extraction: VideoFrameExtractor.ExtractionConfig(
-          framesPerSecond: 1.0,
-          maxFrames: 30,
+          framesPerSecond: 4.0,
+          maxFrames: 120,
           targetWidth: 1024,
           compressionQuality: 0.8
         )
@@ -133,43 +144,62 @@ enum AnalysisMode: String {
           model: defaultVisionModel,
           maxTokensPerBatch: 2000,
           systemPrompt: """
-            You are a QA engineer performing comprehensive analysis of this \(context). Examine each frame carefully and report on:
+            You are an expert analyst performing comprehensive frame-by-frame analysis of this \(context). Examine each frame carefully and provide detailed observations on:
 
-            ## ANIMATIONS
-            - Timing and easing curves (ease-in, ease-out, linear, spring/bounce)
-            - Smoothness - any dropped frames, stutters, or jerky motion?
-            - Start/end states - are initial and final positions correct?
+            ## MOTION & TRANSITIONS
+            - How elements move, appear, or change between frames
+            - Smoothness and fluidity of any animations or transitions
+            - Timing and pacing of visual changes
 
-            ## VISUAL BUGS
-            - Glitches, artifacts, incorrect rendering, clipping issues
-            - Misaligned elements, overlapping content, broken layouts
-            - Text truncation, overflow, incorrect formatting
+            ## VISUAL DETAILS
+            - Layout, composition, and visual hierarchy
+            - Text content, readability, and formatting
+            - Colors, contrast, and visual consistency
+            - Any visual anomalies, glitches, or unexpected elements
 
-            ## ACCESSIBILITY
-            - Text readability and contrast (WCAG AA compliance)
-            - Touch target sizes (44pt minimum for interactive elements)
-            - Color-only indicators that may be problematic
-            - Visual hierarchy clarity
+            ## CONTENT & CONTEXT
+            - What is being shown and its apparent purpose
+            - Key information, data, or messages displayed
+            - User interactions or actions being performed
+            - State changes and their effects
 
-            ## STATE CONSISTENCY
-            - Wrong colors, missing elements, incorrect data
-            - UI state errors or inconsistencies
+            ## QUALITY OBSERVATIONS
+            - Overall visual quality and clarity
+            - Areas that stand out (positively or negatively)
+            - Anything unusual or noteworthy
 
-            Be precise with frame numbers and timestamps when reporting issues.
-            Provide specific recommendations for any problems found.
+            Reference specific frame numbers and timestamps when describing observations.
+            Provide actionable insights and highlight anything significant.
             """,
           imageDetail: "high",
           temperature: 0.1
         ),
         extraction: VideoFrameExtractor.ExtractionConfig(
           framesPerSecond: 30.0,
-          maxFrames: min(effectiveDuration * 30, 120),
-          targetWidth: 1920,
-          compressionQuality: 0.9
+          maxFrames: min(effectiveDuration * 30, 150),
+          targetWidth: 1280,
+          compressionQuality: 0.85
         )
       )
     }
   }
+}
+
+// MARK: - Analysis Cancellation
+
+/// Error thrown when analysis is cancelled by user
+enum AnalysisCancellationError: Error, LocalizedError {
+  case cancelledByUser
+
+  var errorDescription: String? {
+    "Analysis cancelled by user. No results available."
+  }
+}
+
+/// Result of a recording session
+struct RecordingResult {
+  let url: URL
+  let statusUI: RecordingStatusUI?
 }
 
 // MARK: - Recording Orchestrator
@@ -177,20 +207,19 @@ enum AnalysisMode: String {
 /// Orchestrates screen recording with UI feedback and duration handling
 enum RecordingOrchestrator {
 
-  /// Maximum recording duration in seconds
-  static let maxDuration = 30
-
   /// Performs a recording session with optional duration
   /// - Parameters:
   ///   - eventStream: The recording event stream from ScreenRecorder
-  ///   - durationSeconds: nil = manual mode (user clicks Stop, max 30s), Int = timed mode (capped at 30s)
+  ///   - durationSeconds: nil = manual mode (user clicks Stop), Int = timed mode
+  ///   - maxDuration: Maximum allowed recording duration (mode-specific)
   ///   - screenRecorder: The screen recorder instance
-  /// - Returns: Tuple of the recorded video URL and the status UI (for finalization after analysis)
+  /// - Returns: RecordingResult containing URL, status UI, and event stream for cancel monitoring
   static func performRecording(
     eventStream: AsyncStream<ScreenRecorder.RecordingEvent>,
     durationSeconds: Int?,
+    maxDuration: Int,
     screenRecorder: ScreenRecorder
-  ) async throws -> (url: URL, statusUI: RecordingStatusUI?) {
+  ) async throws -> RecordingResult {
     // Cap duration at max
     let effectiveDuration: Int? = durationSeconds.map { min($0, maxDuration) }
 
@@ -236,7 +265,8 @@ enum RecordingOrchestrator {
                 case .stopClicked, .timeout:
                   _ = try? await screenRecorder.stopRecording()
                   return
-                case .ready, .processExited:
+                case .ready, .processExited, .cancelClicked:
+                  // cancelClicked shouldn't happen during recording, ignore
                   break
                 }
               }
@@ -279,7 +309,83 @@ enum RecordingOrchestrator {
       throw ToolError.invalidArgument("Recording failed - no output URL")
     }
 
-    return (url: finalURL, statusUI: statusUI)
+    return RecordingResult(url: finalURL, statusUI: statusUI)
+  }
+
+  /// Performs analysis with cancellation support
+  /// - Parameters:
+  ///   - videoURL: URL of the recorded video
+  ///   - mode: Analysis mode
+  ///   - context: Context description for the prompt
+  ///   - customPrompt: Optional custom prompt
+  ///   - effectiveDuration: Recording duration
+  ///   - frameExtractor: Frame extractor instance
+  ///   - videoAnalyzer: Video analyzer instance
+  ///   - statusUI: Status UI for showing success/error and getting fresh event stream
+  /// - Returns: Analysis result or throws if cancelled/failed
+  static func performAnalysisWithCancellation(
+    videoURL: URL,
+    mode: AnalysisMode,
+    context: String,
+    customPrompt: String?,
+    effectiveDuration: Int,
+    frameExtractor: VideoFrameExtractor,
+    videoAnalyzer: VideoAnalyzer,
+    statusUI: RecordingStatusUI?
+  ) async throws -> (extraction: VideoFrameExtractor.ExtractionResult, analysis: VideoAnalyzer.VideoAnalysisResult) {
+    // Get a fresh event stream from the status UI for analysis phase
+    // This is needed because the recording phase consumes/exhausts the original stream
+    let uiEventStream = await statusUI?.getAnalysisEventStream()
+
+    // If no UI event stream, just run analysis directly
+    guard let uiEventStream = uiEventStream else {
+      return try await analyzeVideo(
+        url: videoURL,
+        mode: mode,
+        context: context,
+        customPrompt: customPrompt,
+        effectiveDuration: effectiveDuration,
+        frameExtractor: frameExtractor,
+        videoAnalyzer: videoAnalyzer
+      )
+    }
+
+    // Run analysis with cancellation monitoring
+    return try await withThrowingTaskGroup(of: (VideoFrameExtractor.ExtractionResult, VideoAnalyzer.VideoAnalysisResult)?.self) { group in
+      // Analysis task
+      group.addTask {
+        try await analyzeVideo(
+          url: videoURL,
+          mode: mode,
+          context: context,
+          customPrompt: customPrompt,
+          effectiveDuration: effectiveDuration,
+          frameExtractor: frameExtractor,
+          videoAnalyzer: videoAnalyzer
+        )
+      }
+
+      // Cancel monitor task
+      group.addTask {
+        for await event in uiEventStream {
+          if case .cancelClicked = event {
+            throw AnalysisCancellationError.cancelledByUser
+          }
+        }
+        return nil // Stream ended without cancel
+      }
+
+      // Wait for first result
+      while let result = try await group.next() {
+        if let analysisResult = result {
+          group.cancelAll()
+          return analysisResult
+        }
+      }
+
+      // Should not reach here
+      throw ToolError.invalidArgument("Analysis failed unexpectedly")
+    }
   }
 
   /// Completes analysis and shows success/error in UI, then terminates
@@ -341,7 +447,16 @@ struct ArgusMCPServer: AsyncParsableCommand {
     version: "1.0.0"
   )
 
+  @Flag(name: .long, help: "Configure Claude Code to use Argus MCP server")
+  var setup = false
+
   mutating func run() async throws {
+    // Handle --setup flag
+    if setup {
+      try runSetup()
+      return
+    }
+
     // Get API key from environment
     guard let apiKey = ProcessInfo.processInfo.environment["OPENAI_API_KEY"] else {
       FileHandle.standardError.write("Error: OPENAI_API_KEY environment variable not set\n".data(using: .utf8)!)
@@ -380,9 +495,9 @@ struct ArgusMCPServer: AsyncParsableCommand {
               "type": "string",
               "description": """
                 Analysis quality level:
-                - 'low': Fast overview (~$0.001) - Quick summary, 15 frames at 0.5fps
-                - 'auto': Balanced detail (~$0.003) - Good for most tasks, 30 frames at 1fps
-                - 'high': Comprehensive analysis (~$0.05+, ⚠️ higher cost) - Frame-by-frame analysis at 30fps, catches animations, bugs, and accessibility issues
+                - 'low': Fast overview (~$0.001) - Quick summary, up to 60 frames at 2fps, max 30s recording
+                - 'auto': Balanced detail (~$0.003) - Good for most tasks, up to 120 frames at 4fps, max 30s recording
+                - 'high': Comprehensive analysis (~$0.05+, ⚠️ higher cost) - Frame-by-frame at 30fps, max 5s recording, catches animations and visual details
                 """,
               "enum": .array(["low", "auto", "high"])
             ]),
@@ -407,15 +522,15 @@ struct ArgusMCPServer: AsyncParsableCommand {
           "properties": .object([
             "duration_seconds": .object([
               "type": "integer",
-              "description": "Duration to record in seconds. If not provided, recording runs until user clicks Stop (max 30s)."
+              "description": "Duration to record in seconds. If not provided, recording runs until user clicks Stop (max depends on mode: 30s for low/auto, 5s for high)."
             ]),
             "mode": .object([
               "type": "string",
               "description": """
                 Analysis quality level:
-                - 'low': Fast overview (~$0.001) - Quick summary
-                - 'auto': Balanced detail (~$0.003) - Good for most tasks
-                - 'high': Comprehensive analysis (~$0.05+, ⚠️ higher cost) - Frame-by-frame, catches animations/bugs/accessibility
+                - 'low': Fast overview (~$0.001) - Quick summary, max 30s recording
+                - 'auto': Balanced detail (~$0.003) - Good for most tasks, max 30s recording
+                - 'high': Comprehensive analysis (~$0.05+, ⚠️ higher cost) - Frame-by-frame at 30fps, max 5s recording
                 """,
               "enum": .array(["low", "auto", "high"])
             ]),
@@ -440,15 +555,15 @@ struct ArgusMCPServer: AsyncParsableCommand {
           "properties": .object([
             "duration_seconds": .object([
               "type": "integer",
-              "description": "Duration to record in seconds. If not provided, recording runs until user clicks Stop (max 30s)."
+              "description": "Duration to record in seconds. If not provided, recording runs until user clicks Stop (max depends on mode: 30s for low/auto, 5s for high)."
             ]),
             "mode": .object([
               "type": "string",
               "description": """
                 Analysis quality level:
-                - 'low': Fast overview (~$0.001) - Quick summary
-                - 'auto': Balanced detail (~$0.003) - Good for most tasks
-                - 'high': Comprehensive analysis (~$0.05+, ⚠️ higher cost) - Frame-by-frame, catches animations/bugs/accessibility
+                - 'low': Fast overview (~$0.001) - Quick summary, max 30s recording
+                - 'auto': Balanced detail (~$0.003) - Good for most tasks, max 30s recording
+                - 'high': Comprehensive analysis (~$0.05+, ⚠️ higher cost) - Frame-by-frame at 30fps, max 5s recording
                 """,
               "enum": .array(["low", "auto", "high"])
             ]),
@@ -574,114 +689,36 @@ func handleAnalyzeVideo(
     throw ToolError.fileNotFound(videoPath)
   }
 
-  // Parse extraction config
-  var framesPerSecond = 1.0
-  var maxFrames = 30
-  var targetWidth = 1024
-  var compressionQuality = 0.8
+  // Get video duration for high mode frame calculation
+  let asset = AVURLAsset(url: url)
+  let duration = try await asset.load(.duration)
+  let effectiveDuration = Int(CMTimeGetSeconds(duration))
 
+  // Parse mode and get configs from centralized source
+  let modeString = arguments["mode"]?.stringValue ?? "auto"
+  let mode = AnalysisMode(rawValue: modeString) ?? .auto
+  var (analysisConfig, extractionConfig) = mode.configs(context: "video", effectiveDuration: effectiveDuration)
+
+  // Apply user overrides for extraction config if provided
   if let fps = arguments["frames_per_second"]?.doubleValue {
-    framesPerSecond = fps
+    extractionConfig = VideoFrameExtractor.ExtractionConfig(
+      framesPerSecond: fps,
+      maxFrames: extractionConfig.maxFrames,
+      targetWidth: extractionConfig.targetWidth,
+      compressionQuality: extractionConfig.compressionQuality
+    )
   }
 
   if let max = arguments["max_frames"]?.intValue {
-    maxFrames = max
+    extractionConfig = VideoFrameExtractor.ExtractionConfig(
+      framesPerSecond: extractionConfig.framesPerSecond,
+      maxFrames: max,
+      targetWidth: extractionConfig.targetWidth,
+      compressionQuality: extractionConfig.compressionQuality
+    )
   }
 
-  // Parse analysis config based on mode
-  var analysisConfig: VideoAnalyzer.AnalysisConfig = .default
-
-  if let mode = arguments["mode"]?.stringValue {
-    switch mode {
-    case "low":
-      // Fast overview - quick summary
-      analysisConfig = VideoAnalyzer.AnalysisConfig(
-        batchSize: 8,
-        model: defaultVisionModel,
-        maxTokensPerBatch: 500,
-        systemPrompt: "Provide a quick, concise summary of what happens in this video. Focus on the main content and key moments.",
-        imageDetail: "low",
-        temperature: 0.3
-      )
-      framesPerSecond = 0.5
-      maxFrames = 15
-      targetWidth = 512
-      compressionQuality = 0.7
-
-    case "auto":
-      // Balanced analysis - good for most tasks
-      analysisConfig = VideoAnalyzer.AnalysisConfig(
-        batchSize: 5,
-        model: defaultVisionModel,
-        maxTokensPerBatch: 1500,
-        systemPrompt: """
-          Explain in detail what happens in this video. Describe:
-          1. The overall content and context
-          2. Step-by-step actions and events
-          3. Important UI elements, text, and visual information
-          4. The purpose and outcome of what's shown
-          Be thorough and educational in your explanation.
-          """,
-        imageDetail: "auto",
-        temperature: 0.3
-      )
-      framesPerSecond = 1.0
-      maxFrames = 30
-      targetWidth = 1024
-      compressionQuality = 0.8
-
-    case "high":
-      // Comprehensive frame-by-frame analysis
-      analysisConfig = VideoAnalyzer.AnalysisConfig(
-        batchSize: 5,
-        model: defaultVisionModel,
-        maxTokensPerBatch: 2000,
-        systemPrompt: """
-          You are a QA engineer performing comprehensive video analysis. Examine each frame carefully and report on:
-
-          ## ANIMATIONS
-          - Timing and easing curves (ease-in, ease-out, linear, spring/bounce)
-          - Smoothness - any dropped frames, stutters, or jerky motion?
-          - Start/end states - are initial and final positions correct?
-
-          ## VISUAL BUGS
-          - Glitches, artifacts, incorrect rendering, clipping issues
-          - Misaligned elements, overlapping content, broken layouts
-          - Text truncation, overflow, incorrect formatting
-
-          ## ACCESSIBILITY
-          - Text readability and contrast (WCAG AA compliance)
-          - Touch target sizes (44pt minimum for interactive elements)
-          - Color-only indicators that may be problematic
-          - Visual hierarchy clarity
-
-          ## STATE CONSISTENCY
-          - Wrong colors, missing elements, incorrect data
-          - UI state errors or inconsistencies
-
-          Be precise with frame numbers and timestamps when reporting issues.
-          Provide specific recommendations for any problems found.
-          """,
-        imageDetail: "high",
-        temperature: 0.1
-      )
-      framesPerSecond = 30.0
-      maxFrames = 120
-      targetWidth = 1920
-      compressionQuality = 0.9
-
-    default:
-      break
-    }
-  }
-
-  let extractionConfig = VideoFrameExtractor.ExtractionConfig(
-    framesPerSecond: framesPerSecond,
-    maxFrames: maxFrames,
-    targetWidth: targetWidth,
-    compressionQuality: compressionQuality
-  )
-
+  // Apply custom prompt if provided
   if let customPrompt = arguments["custom_prompt"]?.stringValue {
     analysisConfig = VideoAnalyzer.AnalysisConfig(
       batchSize: analysisConfig.batchSize,
@@ -712,60 +749,65 @@ func handleRecordAndAnalyze(
   videoAnalyzer: VideoAnalyzer,
   screenRecorder: ScreenRecorder
 ) async throws -> String {
-  // Duration is optional: nil = manual mode, Int = timed mode (capped at 30s)
+  // Duration is optional: nil = manual mode, Int = timed mode (capped based on mode)
   let durationSeconds = arguments["duration_seconds"]?.intValue
   let mode = AnalysisMode(rawValue: arguments["mode"]?.stringValue ?? "auto") ?? .auto
-  let effectiveDuration = durationSeconds.map { min($0, RecordingOrchestrator.maxDuration) } ?? RecordingOrchestrator.maxDuration
+  let effectiveDuration = durationSeconds.map { min($0, mode.maxDuration) } ?? mode.maxDuration
 
   // Start recording
   let eventStream = try await screenRecorder.startRecordingWithEvents()
-  let (videoURL, statusUI) = try await RecordingOrchestrator.performRecording(
+  let recordingResult = try await RecordingOrchestrator.performRecording(
     eventStream: eventStream,
     durationSeconds: durationSeconds,
+    maxDuration: mode.maxDuration,
     screenRecorder: screenRecorder
   )
 
-  // Analyze video
-  var analysisSucceeded = false
-  var extraction: VideoFrameExtractor.ExtractionResult?
-  var analysis: VideoAnalyzer.VideoAnalysisResult?
-
+  // Analyze video with cancellation support
   do {
-    let result = try await analyzeVideo(
-      url: videoURL,
+    let result = try await RecordingOrchestrator.performAnalysisWithCancellation(
+      videoURL: recordingResult.url,
       mode: mode,
       context: "screen recording",
       customPrompt: arguments["custom_prompt"]?.stringValue,
       effectiveDuration: effectiveDuration,
       frameExtractor: frameExtractor,
-      videoAnalyzer: videoAnalyzer
+      videoAnalyzer: videoAnalyzer,
+      statusUI: recordingResult.statusUI
     )
-    extraction = result.extraction
-    analysis = result.analysis
-    analysisSucceeded = true
+
+    // Finalize UI with success
+    if let statusUI = recordingResult.statusUI {
+      await RecordingOrchestrator.finalizeWithUI(success: true, statusUI: statusUI)
+    }
+
+    let durationText = durationSeconds.map { "\($0) seconds" } ?? "manual (user stopped)"
+
+    return """
+      Recording completed and analyzed.
+      Video file: \(recordingResult.url.path)
+      Duration: \(durationText)
+
+      \(formatAnalysisResult(extraction: result.extraction, analysis: result.analysis))
+      """
+  } catch let error as AnalysisCancellationError {
+    // User cancelled - show cancelled state in UI briefly, then dismiss
+    // Do this in background so we can return to Claude Code immediately
+    if let statusUI = recordingResult.statusUI {
+      Task {
+        await statusUI.notifyCancelled()
+        try? await Task.sleep(for: .seconds(1))
+        await MainActor.run { statusUI.terminate() }
+      }
+    }
+    return error.localizedDescription
   } catch {
-    analysisSucceeded = false
+    // Analysis failed - show error in UI
+    if let statusUI = recordingResult.statusUI {
+      await RecordingOrchestrator.finalizeWithUI(success: false, statusUI: statusUI)
+    }
+    throw ToolError.invalidArgument("Video analysis failed: \(error.localizedDescription)")
   }
-
-  // Finalize UI
-  if let statusUI = statusUI {
-    await RecordingOrchestrator.finalizeWithUI(success: analysisSucceeded, statusUI: statusUI)
-  }
-
-  // Re-throw if analysis failed
-  guard analysisSucceeded, let extraction = extraction, let analysis = analysis else {
-    throw ToolError.invalidArgument("Video analysis failed")
-  }
-
-  let durationText = durationSeconds.map { "\($0) seconds" } ?? "manual (user stopped)"
-
-  return """
-    Recording completed and analyzed.
-    Video file: \(videoURL.path)
-    Duration: \(durationText)
-
-    \(formatAnalysisResult(extraction: extraction, analysis: analysis))
-    """
 }
 
 // MARK: - App Recording Handlers
@@ -776,10 +818,10 @@ func handleRecordSimulatorAndAnalyze(
   videoAnalyzer: VideoAnalyzer,
   screenRecorder: ScreenRecorder
 ) async throws -> String {
-  // Duration is optional: nil = manual mode, Int = timed mode (capped at 30s)
+  // Duration is optional: nil = manual mode, Int = timed mode (capped based on mode)
   let durationSeconds = arguments["duration_seconds"]?.intValue
   let mode = AnalysisMode(rawValue: arguments["mode"]?.stringValue ?? "auto") ?? .auto
-  let effectiveDuration = durationSeconds.map { min($0, RecordingOrchestrator.maxDuration) } ?? RecordingOrchestrator.maxDuration
+  let effectiveDuration = durationSeconds.map { min($0, mode.maxDuration) } ?? mode.maxDuration
 
   // Configure recording for simulator (60fps for animations)
   let recordingConfig = ScreenRecorder.RecordingConfig(
@@ -797,54 +839,59 @@ func handleRecordSimulatorAndAnalyze(
     config: recordingConfig,
     outputPath: nil
   )
-  let (videoURL, statusUI) = try await RecordingOrchestrator.performRecording(
+  let recordingResult = try await RecordingOrchestrator.performRecording(
     eventStream: eventStream,
     durationSeconds: durationSeconds,
+    maxDuration: mode.maxDuration,
     screenRecorder: screenRecorder
   )
 
-  // Analyze video
-  var analysisSucceeded = false
-  var extraction: VideoFrameExtractor.ExtractionResult?
-  var analysis: VideoAnalyzer.VideoAnalysisResult?
-
+  // Analyze video with cancellation support
   do {
-    let result = try await analyzeVideo(
-      url: videoURL,
+    let result = try await RecordingOrchestrator.performAnalysisWithCancellation(
+      videoURL: recordingResult.url,
       mode: mode,
       context: "iOS Simulator recording",
       customPrompt: arguments["custom_prompt"]?.stringValue,
       effectiveDuration: effectiveDuration,
       frameExtractor: frameExtractor,
-      videoAnalyzer: videoAnalyzer
+      videoAnalyzer: videoAnalyzer,
+      statusUI: recordingResult.statusUI
     )
-    extraction = result.extraction
-    analysis = result.analysis
-    analysisSucceeded = true
+
+    // Finalize UI with success
+    if let statusUI = recordingResult.statusUI {
+      await RecordingOrchestrator.finalizeWithUI(success: true, statusUI: statusUI)
+    }
+
+    let durationText = durationSeconds.map { "\($0) seconds" } ?? "manual (user stopped)"
+
+    return """
+      iOS Simulator recording completed and analyzed.
+      Video file: \(recordingResult.url.path)
+      Duration: \(durationText)
+      Analysis mode: \(mode.rawValue)
+
+      \(formatAnalysisResult(extraction: result.extraction, analysis: result.analysis))
+      """
+  } catch let error as AnalysisCancellationError {
+    // User cancelled - show cancelled state in UI briefly, then dismiss
+    // Do this in background so we can return to Claude Code immediately
+    if let statusUI = recordingResult.statusUI {
+      Task {
+        await statusUI.notifyCancelled()
+        try? await Task.sleep(for: .seconds(1))
+        await MainActor.run { statusUI.terminate() }
+      }
+    }
+    return error.localizedDescription
   } catch {
-    analysisSucceeded = false
+    // Analysis failed - show error in UI
+    if let statusUI = recordingResult.statusUI {
+      await RecordingOrchestrator.finalizeWithUI(success: false, statusUI: statusUI)
+    }
+    throw ToolError.invalidArgument("Video analysis failed: \(error.localizedDescription)")
   }
-
-  // Finalize UI
-  if let statusUI = statusUI {
-    await RecordingOrchestrator.finalizeWithUI(success: analysisSucceeded, statusUI: statusUI)
-  }
-
-  // Re-throw if analysis failed
-  guard analysisSucceeded, let extraction = extraction, let analysis = analysis else {
-    throw ToolError.invalidArgument("Video analysis failed")
-  }
-
-  let durationText = durationSeconds.map { "\($0) seconds" } ?? "manual (user stopped)"
-
-  return """
-    iOS Simulator recording completed and analyzed.
-    Video file: \(videoURL.path)
-    Duration: \(durationText)
-    Analysis mode: \(mode.rawValue)
-
-    \(formatAnalysisResult(extraction: extraction, analysis: analysis))
-    """
 }
 
 func handleRecordAppAndAnalyze(
@@ -857,10 +904,10 @@ func handleRecordAppAndAnalyze(
     throw ToolError.missingArgument("app_name")
   }
 
-  // Duration is optional: nil = manual mode, Int = timed mode (capped at 30s)
+  // Duration is optional: nil = manual mode, Int = timed mode (capped based on mode)
   let durationSeconds = arguments["duration_seconds"]?.intValue
   let mode = AnalysisMode(rawValue: arguments["mode"]?.stringValue ?? "auto") ?? .auto
-  let effectiveDuration = durationSeconds.map { min($0, RecordingOrchestrator.maxDuration) } ?? RecordingOrchestrator.maxDuration
+  let effectiveDuration = durationSeconds.map { min($0, mode.maxDuration) } ?? mode.maxDuration
 
   // Configure recording for app window (60fps for animations)
   let recordingConfig = ScreenRecorder.RecordingConfig(
@@ -878,54 +925,59 @@ func handleRecordAppAndAnalyze(
     config: recordingConfig,
     outputPath: nil
   )
-  let (videoURL, statusUI) = try await RecordingOrchestrator.performRecording(
+  let recordingResult = try await RecordingOrchestrator.performRecording(
     eventStream: eventStream,
     durationSeconds: durationSeconds,
+    maxDuration: mode.maxDuration,
     screenRecorder: screenRecorder
   )
 
-  // Analyze video
-  var analysisSucceeded = false
-  var extraction: VideoFrameExtractor.ExtractionResult?
-  var analysis: VideoAnalyzer.VideoAnalysisResult?
-
+  // Analyze video with cancellation support
   do {
-    let result = try await analyzeVideo(
-      url: videoURL,
+    let result = try await RecordingOrchestrator.performAnalysisWithCancellation(
+      videoURL: recordingResult.url,
       mode: mode,
       context: "'\(appName)' recording",
       customPrompt: arguments["custom_prompt"]?.stringValue,
       effectiveDuration: effectiveDuration,
       frameExtractor: frameExtractor,
-      videoAnalyzer: videoAnalyzer
+      videoAnalyzer: videoAnalyzer,
+      statusUI: recordingResult.statusUI
     )
-    extraction = result.extraction
-    analysis = result.analysis
-    analysisSucceeded = true
+
+    // Finalize UI with success
+    if let statusUI = recordingResult.statusUI {
+      await RecordingOrchestrator.finalizeWithUI(success: true, statusUI: statusUI)
+    }
+
+    let durationText = durationSeconds.map { "\($0) seconds" } ?? "manual (user stopped)"
+
+    return """
+      '\(appName)' recording completed and analyzed.
+      Video file: \(recordingResult.url.path)
+      Duration: \(durationText)
+      Analysis mode: \(mode.rawValue)
+
+      \(formatAnalysisResult(extraction: result.extraction, analysis: result.analysis))
+      """
+  } catch let error as AnalysisCancellationError {
+    // User cancelled - show cancelled state in UI briefly, then dismiss
+    // Do this in background so we can return to Claude Code immediately
+    if let statusUI = recordingResult.statusUI {
+      Task {
+        await statusUI.notifyCancelled()
+        try? await Task.sleep(for: .seconds(1))
+        await MainActor.run { statusUI.terminate() }
+      }
+    }
+    return error.localizedDescription
   } catch {
-    analysisSucceeded = false
+    // Analysis failed - show error in UI
+    if let statusUI = recordingResult.statusUI {
+      await RecordingOrchestrator.finalizeWithUI(success: false, statusUI: statusUI)
+    }
+    throw ToolError.invalidArgument("Video analysis failed: \(error.localizedDescription)")
   }
-
-  // Finalize UI
-  if let statusUI = statusUI {
-    await RecordingOrchestrator.finalizeWithUI(success: analysisSucceeded, statusUI: statusUI)
-  }
-
-  // Re-throw if analysis failed
-  guard analysisSucceeded, let extraction = extraction, let analysis = analysis else {
-    throw ToolError.invalidArgument("Video analysis failed")
-  }
-
-  let durationText = durationSeconds.map { "\($0) seconds" } ?? "manual (user stopped)"
-
-  return """
-    '\(appName)' recording completed and analyzed.
-    Video file: \(videoURL.path)
-    Duration: \(durationText)
-    Analysis mode: \(mode.rawValue)
-
-    \(formatAnalysisResult(extraction: extraction, analysis: analysis))
-    """
 }
 
 // MARK: - Region Selection Handlers
@@ -1007,10 +1059,10 @@ func handleSelectRecordAndAnalyze(
   videoAnalyzer: VideoAnalyzer,
   screenRecorder: ScreenRecorder
 ) async throws -> String {
-  // Duration is optional: nil = manual mode, Int = timed mode (capped at 30s)
+  // Duration is optional: nil = manual mode, Int = timed mode (capped based on mode)
   let durationSeconds = arguments["duration_seconds"]?.intValue
   let mode = AnalysisMode(rawValue: arguments["mode"]?.stringValue ?? "auto") ?? .auto
-  let effectiveDuration = durationSeconds.map { min($0, RecordingOrchestrator.maxDuration) } ?? RecordingOrchestrator.maxDuration
+  let effectiveDuration = durationSeconds.map { min($0, mode.maxDuration) } ?? mode.maxDuration
 
   // First, launch the visual selector
   let selection = try await launchRegionSelector()
@@ -1045,56 +1097,61 @@ func handleSelectRecordAndAnalyze(
     config: recordingConfig,
     outputPath: nil
   )
-  let (videoURL, statusUI) = try await RecordingOrchestrator.performRecording(
+  let recordingResult = try await RecordingOrchestrator.performRecording(
     eventStream: eventStream,
     durationSeconds: durationSeconds,
+    maxDuration: mode.maxDuration,
     screenRecorder: screenRecorder
   )
 
-  // Analyze video
-  var analysisSucceeded = false
-  var extraction: VideoFrameExtractor.ExtractionResult?
-  var analysis: VideoAnalyzer.VideoAnalysisResult?
-
+  // Analyze video with cancellation support
   do {
-    let result = try await analyzeVideo(
-      url: videoURL,
+    let result = try await RecordingOrchestrator.performAnalysisWithCancellation(
+      videoURL: recordingResult.url,
       mode: mode,
       context: "screen recording",
       customPrompt: arguments["custom_prompt"]?.stringValue,
       effectiveDuration: effectiveDuration,
       frameExtractor: frameExtractor,
-      videoAnalyzer: videoAnalyzer
+      videoAnalyzer: videoAnalyzer,
+      statusUI: recordingResult.statusUI
     )
-    extraction = result.extraction
-    analysis = result.analysis
-    analysisSucceeded = true
+
+    // Finalize UI with success
+    if let statusUI = recordingResult.statusUI {
+      await RecordingOrchestrator.finalizeWithUI(success: true, statusUI: statusUI)
+    }
+
+    let durationText = durationSeconds.map { "\($0) seconds" } ?? "manual (user stopped)"
+
+    return """
+      Screen region recording completed and analyzed!
+
+      Selected region: \(selection.x), \(selection.y) - \(selection.width)x\(selection.height)
+      Video file: \(recordingResult.url.path)
+      Duration: \(durationText)
+      Analysis mode: \(mode.rawValue)
+
+      \(formatAnalysisResult(extraction: result.extraction, analysis: result.analysis))
+      """
+  } catch let error as AnalysisCancellationError {
+    // User cancelled - show cancelled state in UI briefly, then dismiss
+    // Do this in background so we can return to Claude Code immediately
+    if let statusUI = recordingResult.statusUI {
+      Task {
+        await statusUI.notifyCancelled()
+        try? await Task.sleep(for: .seconds(1))
+        await MainActor.run { statusUI.terminate() }
+      }
+    }
+    return error.localizedDescription
   } catch {
-    analysisSucceeded = false
+    // Analysis failed - show error in UI
+    if let statusUI = recordingResult.statusUI {
+      await RecordingOrchestrator.finalizeWithUI(success: false, statusUI: statusUI)
+    }
+    throw ToolError.invalidArgument("Video analysis failed: \(error.localizedDescription)")
   }
-
-  // Finalize UI
-  if let statusUI = statusUI {
-    await RecordingOrchestrator.finalizeWithUI(success: analysisSucceeded, statusUI: statusUI)
-  }
-
-  // Re-throw if analysis failed
-  guard analysisSucceeded, let extraction = extraction, let analysis = analysis else {
-    throw ToolError.invalidArgument("Video analysis failed")
-  }
-
-  let durationText = durationSeconds.map { "\($0) seconds" } ?? "manual (user stopped)"
-
-  return """
-    Screen region recording completed and analyzed!
-
-    Selected region: \(selection.x), \(selection.y) - \(selection.width)x\(selection.height)
-    Video file: \(videoURL.path)
-    Duration: \(durationText)
-    Analysis mode: \(mode.rawValue)
-
-    \(formatAnalysisResult(extraction: extraction, analysis: analysis))
-    """
 }
 
 // MARK: - Helper Functions
@@ -1130,6 +1187,95 @@ func formatAnalysisResult(
       """
     }.joined(separator: "\n\n"))
     """
+}
+
+// MARK: - Setup Command
+
+/// Configures Claude Code to use Argus MCP server
+func runSetup() throws {
+  let claudeConfigPath = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent(".claude.json")
+
+  // Get the path to this executable
+  let executablePath = ProcessInfo.processInfo.arguments[0]
+  let resolvedPath: String
+
+  // Resolve to absolute path if needed
+  if executablePath.hasPrefix("/") {
+    resolvedPath = executablePath
+  } else {
+    let currentDir = FileManager.default.currentDirectoryPath
+    resolvedPath = (currentDir as NSString).appendingPathComponent(executablePath)
+  }
+
+  print("Argus MCP Setup")
+  print("===============")
+  print("")
+  print("Executable path: \(resolvedPath)")
+  print("Claude config: \(claudeConfigPath.path)")
+  print("")
+
+  // Check if config exists
+  var config: [String: Any] = [:]
+  if FileManager.default.fileExists(atPath: claudeConfigPath.path) {
+    if let data = try? Data(contentsOf: claudeConfigPath),
+       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+      config = json
+      print("Found existing ~/.claude.json")
+    }
+  } else {
+    print("No existing ~/.claude.json found, will create one")
+  }
+
+  // Get or create mcpServers
+  var mcpServers = config["mcpServers"] as? [String: Any] ?? [:]
+
+  // Check if argus already configured
+  if mcpServers["argus"] != nil {
+    print("")
+    print("Argus is already configured in ~/.claude.json")
+    print("Current configuration will be updated.")
+  }
+
+  // Create argus config
+  let argusConfig: [String: Any] = [
+    "type": "stdio",
+    "command": resolvedPath,
+    "env": [
+      "OPENAI_API_KEY": ProcessInfo.processInfo.environment["OPENAI_API_KEY"] ?? "YOUR_OPENAI_API_KEY"
+    ]
+  ]
+
+  mcpServers["argus"] = argusConfig
+  config["mcpServers"] = mcpServers
+
+  // Write config
+  let jsonData = try JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted, .sortedKeys])
+  try jsonData.write(to: claudeConfigPath)
+
+  print("")
+  print("Configuration written to ~/.claude.json")
+  print("")
+
+  // Check API key
+  if ProcessInfo.processInfo.environment["OPENAI_API_KEY"] == nil {
+    print("WARNING: OPENAI_API_KEY environment variable not set!")
+    print("")
+    print("You need to edit ~/.claude.json and replace YOUR_OPENAI_API_KEY")
+    print("with your actual OpenAI API key.")
+    print("")
+    print("Get your API key at: https://platform.openai.com/api-keys")
+  } else {
+    print("OpenAI API key detected from environment.")
+  }
+
+  print("")
+  print("Setup complete! Restart Claude Code to use Argus.")
+  print("")
+  print("Available tools:")
+  print("  - record_and_analyze: Record screen and analyze")
+  print("  - select_record_and_analyze: Record selected region")
+  print("  - analyze_video: Analyze existing video file")
 }
 
 // MARK: - Errors

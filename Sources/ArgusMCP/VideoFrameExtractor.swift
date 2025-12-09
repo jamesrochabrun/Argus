@@ -159,6 +159,9 @@ public final class VideoFrameExtractor: Sendable {
     var extractedFrames: [ExtractedFrame] = []
 
     for (index, timestamp) in timestamps.enumerated() {
+      // Check for cancellation before each frame extraction
+      try Task.checkCancellation()
+
       if let frame = try await extractSingleFrame(
         generator: generator,
         ciContext: ciContext,

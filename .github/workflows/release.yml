@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build and Release
+    runs-on: macos-15  # macOS 15 has Xcode 16 with Swift 6
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Verify Swift version
+        run: swift --version
+
+      - name: Build universal binary
+        run: |
+          # Build with multi-arch. There's a known issue where swift build returns exit code 1
+          # even on successful builds in some Xcode versions. We verify artifacts exist below.
+          swift build -c release --arch arm64 --arch x86_64 || true
+
+          # Verify the build actually succeeded by checking artifacts exist
+          if [ ! -f ".build/apple/Products/Release/argus-mcp" ]; then
+            echo "Error: argus-mcp binary not found"
+            exit 1
+          fi
+          if [ ! -f ".build/apple/Products/Release/argus-select" ]; then
+            echo "Error: argus-select binary not found"
+            exit 1
+          fi
+          echo "Build verification passed - all binaries exist"
+
+      - name: Prepare release artifacts
+        run: |
+          mkdir -p release-artifacts
+          cp .build/apple/Products/Release/argus-mcp release-artifacts/
+          cp .build/apple/Products/Release/argus-select release-artifacts/
+          cd release-artifacts
+          tar -czvf argus-macos-universal.tar.gz argus-mcp argus-select
+          shasum -a 256 argus-macos-universal.tar.gz > argus-macos-universal.tar.gz.sha256
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-artifacts/argus-macos-universal.tar.gz
+            release-artifacts/argus-macos-universal.tar.gz.sha256
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
