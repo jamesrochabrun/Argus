@@ -1,4 +1,5 @@
 import ArgumentParser
+import AVFoundation
 import Foundation
 import MCP
 import SwiftOpenAI
@@ -74,6 +75,16 @@ enum AnalysisMode: String {
   case auto
   case high
 
+  /// Maximum recording duration in seconds for this mode
+  var maxDuration: Int {
+    switch self {
+    case .low, .auto:
+      return 30  // Full 30 seconds for low/auto modes
+    case .high:
+      return 5   // Limited to ~5 seconds for high mode (120 frames at 30fps)
+    }
+  }
+
   /// Returns analysis and extraction configs for the given mode
   /// - Parameters:
   ///   - context: Description like "screen recording", "iOS Simulator", etc.
@@ -89,13 +100,13 @@ enum AnalysisMode: String {
           batchSize: 8,
           model: defaultVisionModel,
           maxTokensPerBatch: 500,
-          systemPrompt: "Provide a quick, concise summary of what happens in this \(context). Focus on the main content and key moments.",
+          systemPrompt: "Provide a quick, concise summary of what happens in this \(context). Focus on the main content, key actions, and notable moments.",
           imageDetail: "low",
           temperature: 0.3
         ),
         extraction: VideoFrameExtractor.ExtractionConfig(
-          framesPerSecond: 0.5,
-          maxFrames: 15,
+          framesPerSecond: 2.0,
+          maxFrames: 60,
           targetWidth: 512,
           compressionQuality: 0.7
         )
@@ -108,19 +119,19 @@ enum AnalysisMode: String {
           model: defaultVisionModel,
           maxTokensPerBatch: 1500,
           systemPrompt: """
-            Explain in detail what happens in this \(context). Describe:
-            1. The overall content and context
-            2. Step-by-step actions and events
-            3. Important UI elements, text, and visual information
-            4. The purpose and outcome of what's shown
-            Be thorough and educational in your explanation.
+            Analyze this \(context) in detail. Describe:
+            1. The overall content, setting, and context
+            2. Key actions, events, and transitions as they occur
+            3. Important visual elements, text, and information displayed
+            4. The purpose and outcome of what's being shown
+            Be thorough and clear in your explanation.
             """,
           imageDetail: "auto",
           temperature: 0.3
         ),
         extraction: VideoFrameExtractor.ExtractionConfig(
-          framesPerSecond: 1.0,
-          maxFrames: 30,
+          framesPerSecond: 4.0,
+          maxFrames: 120,
           targetWidth: 1024,
           compressionQuality: 0.8
         )
@@ -133,39 +144,41 @@ enum AnalysisMode: String {
           model: defaultVisionModel,
           maxTokensPerBatch: 2000,
           systemPrompt: """
-            You are a QA engineer performing comprehensive analysis of this \(context). Examine each frame carefully and report on:
+            You are an expert analyst performing comprehensive frame-by-frame analysis of this \(context). Examine each frame carefully and provide detailed observations on:
 
-            ## ANIMATIONS
-            - Timing and easing curves (ease-in, ease-out, linear, spring/bounce)
-            - Smoothness - any dropped frames, stutters, or jerky motion?
-            - Start/end states - are initial and final positions correct?
+            ## MOTION & TRANSITIONS
+            - How elements move, appear, or change between frames
+            - Smoothness and fluidity of any animations or transitions
+            - Timing and pacing of visual changes
 
-            ## VISUAL BUGS
-            - Glitches, artifacts, incorrect rendering, clipping issues
-            - Misaligned elements, overlapping content, broken layouts
-            - Text truncation, overflow, incorrect formatting
+            ## VISUAL DETAILS
+            - Layout, composition, and visual hierarchy
+            - Text content, readability, and formatting
+            - Colors, contrast, and visual consistency
+            - Any visual anomalies, glitches, or unexpected elements
 
-            ## ACCESSIBILITY
-            - Text readability and contrast (WCAG AA compliance)
-            - Touch target sizes (44pt minimum for interactive elements)
-            - Color-only indicators that may be problematic
-            - Visual hierarchy clarity
+            ## CONTENT & CONTEXT
+            - What is being shown and its apparent purpose
+            - Key information, data, or messages displayed
+            - User interactions or actions being performed
+            - State changes and their effects
 
-            ## STATE CONSISTENCY
-            - Wrong colors, missing elements, incorrect data
-            - UI state errors or inconsistencies
+            ## QUALITY OBSERVATIONS
+            - Overall visual quality and clarity
+            - Areas that stand out (positively or negatively)
+            - Anything unusual or noteworthy
 
-            Be precise with frame numbers and timestamps when reporting issues.
-            Provide specific recommendations for any problems found.
+            Reference specific frame numbers and timestamps when describing observations.
+            Provide actionable insights and highlight anything significant.
             """,
           imageDetail: "high",
           temperature: 0.1
         ),
         extraction: VideoFrameExtractor.ExtractionConfig(
           framesPerSecond: 30.0,
-          maxFrames: min(effectiveDuration * 30, 120),
-          targetWidth: 1920,
-          compressionQuality: 0.9
+          maxFrames: min(effectiveDuration * 30, 150),
+          targetWidth: 1280,
+          compressionQuality: 0.85
         )
       )
     }
@@ -194,18 +207,17 @@ struct RecordingResult {
 /// Orchestrates screen recording with UI feedback and duration handling
 enum RecordingOrchestrator {
 
-  /// Maximum recording duration in seconds
-  static let maxDuration = 30
-
   /// Performs a recording session with optional duration
   /// - Parameters:
   ///   - eventStream: The recording event stream from ScreenRecorder
-  ///   - durationSeconds: nil = manual mode (user clicks Stop, max 30s), Int = timed mode (capped at 30s)
+  ///   - durationSeconds: nil = manual mode (user clicks Stop), Int = timed mode
+  ///   - maxDuration: Maximum allowed recording duration (mode-specific)
   ///   - screenRecorder: The screen recorder instance
   /// - Returns: RecordingResult containing URL, status UI, and event stream for cancel monitoring
   static func performRecording(
     eventStream: AsyncStream<ScreenRecorder.RecordingEvent>,
     durationSeconds: Int?,
+    maxDuration: Int,
     screenRecorder: ScreenRecorder
   ) async throws -> RecordingResult {
     // Cap duration at max
@@ -483,9 +495,9 @@ struct ArgusMCPServer: AsyncParsableCommand {
               "type": "string",
               "description": """
                 Analysis quality level:
-                - 'low': Fast overview (~$0.001) - Quick summary, 15 frames at 0.5fps
-                - 'auto': Balanced detail (~$0.003) - Good for most tasks, 30 frames at 1fps
-                - 'high': Comprehensive analysis (~$0.05+, ⚠️ higher cost) - Frame-by-frame analysis at 30fps, catches animations, bugs, and accessibility issues
+                - 'low': Fast overview (~$0.001) - Quick summary, up to 60 frames at 2fps, max 30s recording
+                - 'auto': Balanced detail (~$0.003) - Good for most tasks, up to 120 frames at 4fps, max 30s recording
+                - 'high': Comprehensive analysis (~$0.05+, ⚠️ higher cost) - Frame-by-frame at 30fps, max 5s recording, catches animations and visual details
                 """,
               "enum": .array(["low", "auto", "high"])
             ]),
@@ -510,15 +522,15 @@ struct ArgusMCPServer: AsyncParsableCommand {
           "properties": .object([
             "duration_seconds": .object([
               "type": "integer",
-              "description": "Duration to record in seconds. If not provided, recording runs until user clicks Stop (max 30s)."
+              "description": "Duration to record in seconds. If not provided, recording runs until user clicks Stop (max depends on mode: 30s for low/auto, 5s for high)."
             ]),
             "mode": .object([
               "type": "string",
               "description": """
                 Analysis quality level:
-                - 'low': Fast overview (~$0.001) - Quick summary
-                - 'auto': Balanced detail (~$0.003) - Good for most tasks
-                - 'high': Comprehensive analysis (~$0.05+, ⚠️ higher cost) - Frame-by-frame, catches animations/bugs/accessibility
+                - 'low': Fast overview (~$0.001) - Quick summary, max 30s recording
+                - 'auto': Balanced detail (~$0.003) - Good for most tasks, max 30s recording
+                - 'high': Comprehensive analysis (~$0.05+, ⚠️ higher cost) - Frame-by-frame at 30fps, max 5s recording
                 """,
               "enum": .array(["low", "auto", "high"])
             ]),
@@ -543,15 +555,15 @@ struct ArgusMCPServer: AsyncParsableCommand {
           "properties": .object([
             "duration_seconds": .object([
               "type": "integer",
-              "description": "Duration to record in seconds. If not provided, recording runs until user clicks Stop (max 30s)."
+              "description": "Duration to record in seconds. If not provided, recording runs until user clicks Stop (max depends on mode: 30s for low/auto, 5s for high)."
             ]),
             "mode": .object([
               "type": "string",
               "description": """
                 Analysis quality level:
-                - 'low': Fast overview (~$0.001) - Quick summary
-                - 'auto': Balanced detail (~$0.003) - Good for most tasks
-                - 'high': Comprehensive analysis (~$0.05+, ⚠️ higher cost) - Frame-by-frame, catches animations/bugs/accessibility
+                - 'low': Fast overview (~$0.001) - Quick summary, max 30s recording
+                - 'auto': Balanced detail (~$0.003) - Good for most tasks, max 30s recording
+                - 'high': Comprehensive analysis (~$0.05+, ⚠️ higher cost) - Frame-by-frame at 30fps, max 5s recording
                 """,
               "enum": .array(["low", "auto", "high"])
             ]),
@@ -677,114 +689,36 @@ func handleAnalyzeVideo(
     throw ToolError.fileNotFound(videoPath)
   }
 
-  // Parse extraction config
-  var framesPerSecond = 1.0
-  var maxFrames = 30
-  var targetWidth = 1024
-  var compressionQuality = 0.8
+  // Get video duration for high mode frame calculation
+  let asset = AVURLAsset(url: url)
+  let duration = try await asset.load(.duration)
+  let effectiveDuration = Int(CMTimeGetSeconds(duration))
 
+  // Parse mode and get configs from centralized source
+  let modeString = arguments["mode"]?.stringValue ?? "auto"
+  let mode = AnalysisMode(rawValue: modeString) ?? .auto
+  var (analysisConfig, extractionConfig) = mode.configs(context: "video", effectiveDuration: effectiveDuration)
+
+  // Apply user overrides for extraction config if provided
   if let fps = arguments["frames_per_second"]?.doubleValue {
-    framesPerSecond = fps
+    extractionConfig = VideoFrameExtractor.ExtractionConfig(
+      framesPerSecond: fps,
+      maxFrames: extractionConfig.maxFrames,
+      targetWidth: extractionConfig.targetWidth,
+      compressionQuality: extractionConfig.compressionQuality
+    )
   }
 
   if let max = arguments["max_frames"]?.intValue {
-    maxFrames = max
+    extractionConfig = VideoFrameExtractor.ExtractionConfig(
+      framesPerSecond: extractionConfig.framesPerSecond,
+      maxFrames: max,
+      targetWidth: extractionConfig.targetWidth,
+      compressionQuality: extractionConfig.compressionQuality
+    )
   }
 
-  // Parse analysis config based on mode
-  var analysisConfig: VideoAnalyzer.AnalysisConfig = .default
-
-  if let mode = arguments["mode"]?.stringValue {
-    switch mode {
-    case "low":
-      // Fast overview - quick summary
-      analysisConfig = VideoAnalyzer.AnalysisConfig(
-        batchSize: 8,
-        model: defaultVisionModel,
-        maxTokensPerBatch: 500,
-        systemPrompt: "Provide a quick, concise summary of what happens in this video. Focus on the main content and key moments.",
-        imageDetail: "low",
-        temperature: 0.3
-      )
-      framesPerSecond = 0.5
-      maxFrames = 15
-      targetWidth = 512
-      compressionQuality = 0.7
-
-    case "auto":
-      // Balanced analysis - good for most tasks
-      analysisConfig = VideoAnalyzer.AnalysisConfig(
-        batchSize: 5,
-        model: defaultVisionModel,
-        maxTokensPerBatch: 1500,
-        systemPrompt: """
-          Explain in detail what happens in this video. Describe:
-          1. The overall content and context
-          2. Step-by-step actions and events
-          3. Important UI elements, text, and visual information
-          4. The purpose and outcome of what's shown
-          Be thorough and educational in your explanation.
-          """,
-        imageDetail: "auto",
-        temperature: 0.3
-      )
-      framesPerSecond = 1.0
-      maxFrames = 30
-      targetWidth = 1024
-      compressionQuality = 0.8
-
-    case "high":
-      // Comprehensive frame-by-frame analysis
-      analysisConfig = VideoAnalyzer.AnalysisConfig(
-        batchSize: 5,
-        model: defaultVisionModel,
-        maxTokensPerBatch: 2000,
-        systemPrompt: """
-          You are a QA engineer performing comprehensive video analysis. Examine each frame carefully and report on:
-
-          ## ANIMATIONS
-          - Timing and easing curves (ease-in, ease-out, linear, spring/bounce)
-          - Smoothness - any dropped frames, stutters, or jerky motion?
-          - Start/end states - are initial and final positions correct?
-
-          ## VISUAL BUGS
-          - Glitches, artifacts, incorrect rendering, clipping issues
-          - Misaligned elements, overlapping content, broken layouts
-          - Text truncation, overflow, incorrect formatting
-
-          ## ACCESSIBILITY
-          - Text readability and contrast (WCAG AA compliance)
-          - Touch target sizes (44pt minimum for interactive elements)
-          - Color-only indicators that may be problematic
-          - Visual hierarchy clarity
-
-          ## STATE CONSISTENCY
-          - Wrong colors, missing elements, incorrect data
-          - UI state errors or inconsistencies
-
-          Be precise with frame numbers and timestamps when reporting issues.
-          Provide specific recommendations for any problems found.
-          """,
-        imageDetail: "high",
-        temperature: 0.1
-      )
-      framesPerSecond = 30.0
-      maxFrames = 120
-      targetWidth = 1920
-      compressionQuality = 0.9
-
-    default:
-      break
-    }
-  }
-
-  let extractionConfig = VideoFrameExtractor.ExtractionConfig(
-    framesPerSecond: framesPerSecond,
-    maxFrames: maxFrames,
-    targetWidth: targetWidth,
-    compressionQuality: compressionQuality
-  )
-
+  // Apply custom prompt if provided
   if let customPrompt = arguments["custom_prompt"]?.stringValue {
     analysisConfig = VideoAnalyzer.AnalysisConfig(
       batchSize: analysisConfig.batchSize,
@@ -815,16 +749,17 @@ func handleRecordAndAnalyze(
   videoAnalyzer: VideoAnalyzer,
   screenRecorder: ScreenRecorder
 ) async throws -> String {
-  // Duration is optional: nil = manual mode, Int = timed mode (capped at 30s)
+  // Duration is optional: nil = manual mode, Int = timed mode (capped based on mode)
   let durationSeconds = arguments["duration_seconds"]?.intValue
   let mode = AnalysisMode(rawValue: arguments["mode"]?.stringValue ?? "auto") ?? .auto
-  let effectiveDuration = durationSeconds.map { min($0, RecordingOrchestrator.maxDuration) } ?? RecordingOrchestrator.maxDuration
+  let effectiveDuration = durationSeconds.map { min($0, mode.maxDuration) } ?? mode.maxDuration
 
   // Start recording
   let eventStream = try await screenRecorder.startRecordingWithEvents()
   let recordingResult = try await RecordingOrchestrator.performRecording(
     eventStream: eventStream,
     durationSeconds: durationSeconds,
+    maxDuration: mode.maxDuration,
     screenRecorder: screenRecorder
   )
 
@@ -883,10 +818,10 @@ func handleRecordSimulatorAndAnalyze(
   videoAnalyzer: VideoAnalyzer,
   screenRecorder: ScreenRecorder
 ) async throws -> String {
-  // Duration is optional: nil = manual mode, Int = timed mode (capped at 30s)
+  // Duration is optional: nil = manual mode, Int = timed mode (capped based on mode)
   let durationSeconds = arguments["duration_seconds"]?.intValue
   let mode = AnalysisMode(rawValue: arguments["mode"]?.stringValue ?? "auto") ?? .auto
-  let effectiveDuration = durationSeconds.map { min($0, RecordingOrchestrator.maxDuration) } ?? RecordingOrchestrator.maxDuration
+  let effectiveDuration = durationSeconds.map { min($0, mode.maxDuration) } ?? mode.maxDuration
 
   // Configure recording for simulator (60fps for animations)
   let recordingConfig = ScreenRecorder.RecordingConfig(
@@ -907,6 +842,7 @@ func handleRecordSimulatorAndAnalyze(
   let recordingResult = try await RecordingOrchestrator.performRecording(
     eventStream: eventStream,
     durationSeconds: durationSeconds,
+    maxDuration: mode.maxDuration,
     screenRecorder: screenRecorder
   )
 
@@ -968,10 +904,10 @@ func handleRecordAppAndAnalyze(
     throw ToolError.missingArgument("app_name")
   }
 
-  // Duration is optional: nil = manual mode, Int = timed mode (capped at 30s)
+  // Duration is optional: nil = manual mode, Int = timed mode (capped based on mode)
   let durationSeconds = arguments["duration_seconds"]?.intValue
   let mode = AnalysisMode(rawValue: arguments["mode"]?.stringValue ?? "auto") ?? .auto
-  let effectiveDuration = durationSeconds.map { min($0, RecordingOrchestrator.maxDuration) } ?? RecordingOrchestrator.maxDuration
+  let effectiveDuration = durationSeconds.map { min($0, mode.maxDuration) } ?? mode.maxDuration
 
   // Configure recording for app window (60fps for animations)
   let recordingConfig = ScreenRecorder.RecordingConfig(
@@ -992,6 +928,7 @@ func handleRecordAppAndAnalyze(
   let recordingResult = try await RecordingOrchestrator.performRecording(
     eventStream: eventStream,
     durationSeconds: durationSeconds,
+    maxDuration: mode.maxDuration,
     screenRecorder: screenRecorder
   )
 
@@ -1122,10 +1059,10 @@ func handleSelectRecordAndAnalyze(
   videoAnalyzer: VideoAnalyzer,
   screenRecorder: ScreenRecorder
 ) async throws -> String {
-  // Duration is optional: nil = manual mode, Int = timed mode (capped at 30s)
+  // Duration is optional: nil = manual mode, Int = timed mode (capped based on mode)
   let durationSeconds = arguments["duration_seconds"]?.intValue
   let mode = AnalysisMode(rawValue: arguments["mode"]?.stringValue ?? "auto") ?? .auto
-  let effectiveDuration = durationSeconds.map { min($0, RecordingOrchestrator.maxDuration) } ?? RecordingOrchestrator.maxDuration
+  let effectiveDuration = durationSeconds.map { min($0, mode.maxDuration) } ?? mode.maxDuration
 
   // First, launch the visual selector
   let selection = try await launchRegionSelector()
@@ -1163,6 +1100,7 @@ func handleSelectRecordAndAnalyze(
   let recordingResult = try await RecordingOrchestrator.performRecording(
     eventStream: eventStream,
     durationSeconds: durationSeconds,
+    maxDuration: mode.maxDuration,
     screenRecorder: screenRecorder
   )
 
