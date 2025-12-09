@@ -7,61 +7,6 @@ import SwiftOpenAI
 // Type alias to disambiguate Tool types
 typealias MCPTool = MCP.Tool
 
-// MARK: - Recording Session State
-
-/// Manages the recording status UI across start/stop calls
-@MainActor
-final class RecordingSession {
-  static let shared = RecordingSession()
-
-  private var statusUI: RecordingStatusUI?
-  private var uiEventTask: Task<Void, Never>?
-
-  private init() {}
-
-  /// Start the status UI for a recording session
-  func startUI(durationSeconds: Int? = nil, onStopRequested: @escaping () async -> Void) async {
-    // Clean up any existing UI
-    await stopUI()
-
-    statusUI = RecordingStatusUI()
-
-    do {
-      let events = try await statusUI!.launch(config: .init(durationSeconds: durationSeconds))
-
-      // Listen for UI events in background
-      uiEventTask = Task {
-        for await event in events {
-          switch event {
-          case .stopClicked, .timeout:
-            await onStopRequested()
-            return
-          case .ready, .processExited, .cancelClicked:
-            break
-          }
-        }
-      }
-    } catch {
-      FileHandle.standardError.write("Warning: Could not launch recording status UI: \(error)\n".data(using: .utf8)!)
-      statusUI = nil
-    }
-  }
-
-  /// Notify that recording has started (first frame captured)
-  func notifyRecordingStarted() async {
-    await statusUI?.notifyRecordingStarted()
-  }
-
-  /// Stop the status UI
-  func stopUI() async {
-    uiEventTask?.cancel()
-    uiEventTask = nil
-    await statusUI?.notifyRecordingStopped()
-    statusUI?.terminate()
-    statusUI = nil
-  }
-}
-
 // MARK: - Model Configuration
 
 /// Default model for video analysis - change this to swap models globally
@@ -237,70 +182,115 @@ enum RecordingOrchestrator {
 
     var videoURL: URL?
 
-    // Process recording events
-    for await event in eventStream {
-      switch event {
-      case .started(let url):
-        videoURL = url
+    // Timeout for first frame capture (5 seconds)
+    // If ScreenCaptureKit doesn't produce frames, we don't want to hang forever
+    let firstFrameTimeoutSeconds = 5
 
-      case .firstFrameCaptured:
-        // Notify UI that recording has started
-        await statusUI.notifyRecordingStarted()
+    // Process recording events with timeout for first frame
+    // We use a task group to race between event processing and timeout
+    let recordingResult: (url: URL?, timedOut: Bool) = try await withThrowingTaskGroup(of: (url: URL?, timedOut: Bool).self) { group in
 
-        // Race between duration timer (if timed mode) and UI stop events
-        if let uiEvents = uiEvents {
-          await withTaskGroup(of: Void.self) { group in
-            // Timer task (only if duration specified - timed mode)
-            if let duration = effectiveDuration {
-              group.addTask {
+      // Main event processing task
+      group.addTask {
+        var url: URL?
+        var receivedFirstFrame = false
+
+        for await event in eventStream {
+          switch event {
+          case .started(let startedURL):
+            url = startedURL
+
+          case .firstFrameCaptured:
+            receivedFirstFrame = true
+            // Notify UI that recording has started (timer begins)
+            await statusUI.notifyRecordingStarted()
+
+            // Race between duration timer (if timed mode) and UI stop events
+            if let uiEvents = uiEvents {
+              await withTaskGroup(of: Void.self) { innerGroup in
+                // Timer task (only if duration specified - timed mode)
+                if let duration = effectiveDuration {
+                  innerGroup.addTask {
+                    try? await Task.sleep(for: .seconds(duration))
+                    _ = try? await screenRecorder.stopRecording()
+                  }
+                }
+
+                // UI events task (handles Stop button and timeout for manual mode)
+                innerGroup.addTask {
+                  for await uiEvent in uiEvents {
+                    switch uiEvent {
+                    case .stopClicked, .timeout:
+                      _ = try? await screenRecorder.stopRecording()
+                      return
+                    case .ready, .processExited, .cancelClicked:
+                      break
+                    }
+                  }
+                }
+
+                await innerGroup.next()
+                innerGroup.cancelAll()
+              }
+            } else {
+              // No UI available
+              if let duration = effectiveDuration {
                 try? await Task.sleep(for: .seconds(duration))
+                _ = try? await screenRecorder.stopRecording()
+              } else {
+                try? await Task.sleep(for: .seconds(maxDuration))
                 _ = try? await screenRecorder.stopRecording()
               }
             }
 
-            // UI events task (handles Stop button and timeout for manual mode)
-            group.addTask {
-              for await event in uiEvents {
-                switch event {
-                case .stopClicked, .timeout:
-                  _ = try? await screenRecorder.stopRecording()
-                  return
-                case .ready, .processExited, .cancelClicked:
-                  // cancelClicked shouldn't happen during recording, ignore
-                  break
-                }
-              }
-            }
+          case .stopped(let stoppedURL):
+            url = stoppedURL
+            await statusUI.notifyAnalyzing()
+            return (url: url, timedOut: false)
 
-            // Wait for first task to complete
-            await group.next()
-            group.cancelAll()
-          }
-        } else {
-          // No UI available
-          if let duration = effectiveDuration {
-            // Timed mode: wait for specified duration
-            try await Task.sleep(for: .seconds(duration))
-            _ = try await screenRecorder.stopRecording()
-          } else {
-            // Manual mode but no UI - use max duration as safety fallback
-            try await Task.sleep(for: .seconds(maxDuration))
-            _ = try await screenRecorder.stopRecording()
+          case .error(let message):
+            await statusUI.notifyError()
+            try? await Task.sleep(for: .seconds(1.5))
+            await MainActor.run { statusUI.terminate() }
+            throw ToolError.invalidArgument(message)
           }
         }
 
-      case .stopped(let url):
-        videoURL = url
-        // Notify UI to show analyzing state
-        await statusUI.notifyAnalyzing()
+        // If we get here without receiving first frame, something went wrong
+        if !receivedFirstFrame {
+          return (url: nil, timedOut: true)
+        }
 
-      case .error(let message):
-        await statusUI.notifyError()
-        try? await Task.sleep(for: .seconds(1.5))
-        await MainActor.run { statusUI.terminate() }
-        throw ToolError.invalidArgument(message)
+        return (url: url, timedOut: false)
       }
+
+      // Timeout task - only triggers if first frame doesn't arrive
+      group.addTask {
+        try await Task.sleep(for: .seconds(firstFrameTimeoutSeconds))
+        return (url: nil, timedOut: true)
+      }
+
+      // Wait for first task to complete
+      if let result = try await group.next() {
+        group.cancelAll()
+        return result
+      }
+
+      return (url: nil, timedOut: true)
     }
+
+    // Handle timeout case
+    if recordingResult.timedOut {
+      FileHandle.standardError.write("Error: Timed out waiting for first frame from ScreenCaptureKit\n".data(using: .utf8)!)
+      await statusUI.notifyError()
+      try? await Task.sleep(for: .seconds(1.5))
+      await MainActor.run { statusUI.terminate() }
+      // Try to stop the recording to clean up
+      _ = try? await screenRecorder.stopRecording()
+      throw ToolError.invalidArgument("Recording failed - screen capture did not start. Please try again.")
+    }
+
+    videoURL = recordingResult.url
 
     guard let finalURL = videoURL else {
       await statusUI.notifyError()
@@ -400,6 +390,32 @@ enum RecordingOrchestrator {
     }
     try? await Task.sleep(for: .seconds(1.5))
     await MainActor.run { statusUI.terminate() }
+  }
+}
+
+// MARK: - Session Cleanup
+
+/// Kills orphan argus-status and argus-select processes to ensure fresh recording state.
+/// This is called at the start of each tool handler to prevent state corruption from
+/// incomplete previous operations.
+func cleanupOrphanProcesses() {
+  let processNames = ["argus-status", "argus-select"]
+
+  for processName in processNames {
+    let killProcess = Process()
+    killProcess.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+    killProcess.arguments = ["-9", processName]  // SIGKILL for immediate termination
+
+    // Redirect stderr to null to suppress "no matching processes" errors
+    killProcess.standardError = FileHandle.nullDevice
+    killProcess.standardOutput = FileHandle.nullDevice
+
+    do {
+      try killProcess.run()
+      killProcess.waitUntilExit()  // Blocking - ensures cleanup completes before continuing
+    } catch {
+      // Silently ignore errors (process may not exist, which is fine)
+    }
   }
 }
 
@@ -678,6 +694,9 @@ func handleAnalyzeVideo(
   frameExtractor: VideoFrameExtractor,
   videoAnalyzer: VideoAnalyzer
 ) async throws -> String {
+  // Kill any orphan UI processes from previous sessions
+  cleanupOrphanProcesses()
+
   guard let videoPath = arguments["video_path"]?.stringValue else {
     throw ToolError.missingArgument("video_path")
   }
@@ -749,6 +768,10 @@ func handleRecordAndAnalyze(
   videoAnalyzer: VideoAnalyzer,
   screenRecorder: ScreenRecorder
 ) async throws -> String {
+  // Ensure clean state before starting new recording
+  cleanupOrphanProcesses()
+  await screenRecorder.forceReset()
+
   // Duration is optional: nil = manual mode, Int = timed mode (capped based on mode)
   let durationSeconds = arguments["duration_seconds"]?.intValue
   let mode = AnalysisMode(rawValue: arguments["mode"]?.stringValue ?? "auto") ?? .auto
@@ -818,6 +841,10 @@ func handleRecordSimulatorAndAnalyze(
   videoAnalyzer: VideoAnalyzer,
   screenRecorder: ScreenRecorder
 ) async throws -> String {
+  // Ensure clean state before starting new recording
+  cleanupOrphanProcesses()
+  await screenRecorder.forceReset()
+
   // Duration is optional: nil = manual mode, Int = timed mode (capped based on mode)
   let durationSeconds = arguments["duration_seconds"]?.intValue
   let mode = AnalysisMode(rawValue: arguments["mode"]?.stringValue ?? "auto") ?? .auto
@@ -900,6 +927,10 @@ func handleRecordAppAndAnalyze(
   videoAnalyzer: VideoAnalyzer,
   screenRecorder: ScreenRecorder
 ) async throws -> String {
+  // Ensure clean state before starting new recording
+  cleanupOrphanProcesses()
+  await screenRecorder.forceReset()
+
   guard let appName = arguments["app_name"]?.stringValue else {
     throw ToolError.missingArgument("app_name")
   }
@@ -1059,6 +1090,10 @@ func handleSelectRecordAndAnalyze(
   videoAnalyzer: VideoAnalyzer,
   screenRecorder: ScreenRecorder
 ) async throws -> String {
+  // Ensure clean state before starting new recording
+  cleanupOrphanProcesses()
+  await screenRecorder.forceReset()
+
   // Duration is optional: nil = manual mode, Int = timed mode (capped based on mode)
   let durationSeconds = arguments["duration_seconds"]?.intValue
   let mode = AnalysisMode(rawValue: arguments["mode"]?.stringValue ?? "auto") ?? .auto

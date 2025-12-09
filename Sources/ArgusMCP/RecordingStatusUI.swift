@@ -245,6 +245,7 @@ public final class RecordingStatusUI {
 
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
       let fileHandle = outputPipe.fileHandleForReading
+      var buffer = Data()
 
       while true {
         let data = fileHandle.availableData
@@ -253,20 +254,28 @@ public final class RecordingStatusUI {
           return
         }
 
-        // Parse JSON response
-        if let response = try? JSONDecoder().decode(StatusResponse.self, from: data) {
-          Task { @MainActor [weak self] in
-            switch response.type {
-            case .ready:
-              self?.eventContinuation?.yield(.ready)
-            case .stopClicked:
-              self?.eventContinuation?.yield(.stopClicked)
-            case .timeout:
-              self?.eventContinuation?.yield(.timeout)
-            case .cancelClicked:
-              // Yield to BOTH continuations so analysis phase can receive cancel events
-              self?.eventContinuation?.yield(.cancelClicked)
-              self?.analysisContinuation?.yield(.cancelClicked)
+        buffer.append(data)
+
+        // Process complete lines (newline-delimited JSON)
+        while let newlineIndex = buffer.firstIndex(of: UInt8(ascii: "\n")) {
+          let lineData = Data(buffer.prefix(upTo: newlineIndex))
+          buffer = Data(buffer.suffix(from: buffer.index(after: newlineIndex)))
+
+          // Parse JSON response from this line
+          if let response = try? JSONDecoder().decode(StatusResponse.self, from: lineData) {
+            Task { @MainActor [weak self] in
+              switch response.type {
+              case .ready:
+                self?.eventContinuation?.yield(.ready)
+              case .stopClicked:
+                self?.eventContinuation?.yield(.stopClicked)
+              case .timeout:
+                self?.eventContinuation?.yield(.timeout)
+              case .cancelClicked:
+                // Yield to BOTH continuations so analysis phase can receive cancel events
+                self?.eventContinuation?.yield(.cancelClicked)
+                self?.analysisContinuation?.yield(.cancelClicked)
+              }
             }
           }
         }
