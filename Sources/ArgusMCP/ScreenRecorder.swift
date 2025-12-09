@@ -620,6 +620,7 @@ public actor ScreenRecorder {
     assetWriter?.startSession(atSourceTime: .zero)
 
     try await self.stream?.startCapture()
+    FileHandle.standardError.write("Debug: startCapture() succeeded, assetWriter status: \(assetWriter?.status.rawValue ?? -1)\n".data(using: .utf8)!)
 
     state = .recording
 
@@ -685,6 +686,59 @@ public actor ScreenRecorder {
   /// Get current recording state
   public func getState() -> RecordingState {
     return state
+  }
+
+  /// Force reset the recorder to idle state, cleaning up any partial state.
+  /// Call this before starting a new recording to ensure clean state.
+  /// This handles cases where the recorder got stuck in preparing/stopping states.
+  public func forceReset() async {
+    // Stop stream output writing first to prevent any late frames
+    streamOutput?.stopWriting()
+
+    // Stop any active stream - log errors instead of silently ignoring
+    if let activeStream = self.stream {
+      do {
+        try await activeStream.stopCapture()
+      } catch {
+        FileHandle.standardError.write("Warning: Failed to stop capture during reset: \(error.localizedDescription)\n".data(using: .utf8)!)
+      }
+
+      // Try to remove the output handler to fully release the stream
+      if let output = streamOutput {
+        do {
+          try activeStream.removeStreamOutput(output, type: .screen)
+        } catch {
+          // This might fail if stream is already stopped, that's OK
+        }
+      }
+    }
+
+    // Cancel video input
+    videoInput?.markAsFinished()
+
+    // Cancel asset writer if active
+    if let writer = assetWriter, writer.status == .writing {
+      writer.cancelWriting()
+    }
+
+    // Finish any pending event stream
+    eventContinuation?.finish()
+
+    // Clear all references
+    stream = nil
+    streamOutput = nil
+    assetWriter = nil
+    videoInput = nil
+    pixelBufferAdaptor = nil
+    outputURL = nil
+    eventContinuation = nil
+
+    // Force state to idle
+    state = .idle
+
+    // Small delay to allow ScreenCaptureKit to fully release resources
+    // This helps prevent issues when starting a new capture immediately after
+    try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
   }
 
   public enum RecorderError: Error, LocalizedError {
@@ -767,8 +821,14 @@ private class StreamOutput: NSObject, SCStreamOutput {
     stoppedLock.unlock()
     guard !stopped else { return }
 
-    guard assetWriter.status == .writing else { return }
-    guard videoInput.isReadyForMoreMediaData else { return }
+    guard assetWriter.status == .writing else {
+      FileHandle.standardError.write("Debug: Frame dropped - assetWriter status: \(assetWriter.status.rawValue)\n".data(using: .utf8)!)
+      return
+    }
+    guard videoInput.isReadyForMoreMediaData else {
+      FileHandle.standardError.write("Debug: Frame dropped - videoInput not ready\n".data(using: .utf8)!)
+      return
+    }
 
     let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
 
