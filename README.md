@@ -82,17 +82,17 @@ Add to `~/.claude.json`:
 
 ## Analysis Modes
 
-| Mode | Description | FPS | Max Frames | Resolution | Est. Cost |
-|------|-------------|-----|------------|------------|-----------|
-| `low` | Fast overview, quick summary | 0.5 | 15 | 512px | ~$0.001 |
-| `auto` | Balanced detail, good for most tasks | 1.0 | 30 | 1024px | ~$0.003 |
-| `high` | Comprehensive frame-by-frame analysis | 30.0 | 120 | 1920px | ~$0.05+ |
+| Mode | Description | FPS | Max Frames | Max Duration | Resolution | Est. Cost |
+|------|-------------|-----|------------|--------------|------------|-----------|
+| `low` | Fast overview, quick summary | 2.0 | 60 | 30s | 512px | ~$0.002 |
+| `auto` | Balanced detail, good for most tasks | 4.0 | 120 | 30s | 1024px | ~$0.005 |
+| `high` | Comprehensive frame-by-frame analysis | 30.0 | 150 | 5s | 1280px | ~$0.05+ |
 
 ### Choosing the Right Mode
 
-- **`low`**: Quick summary of what's in the video
-- **`auto`**: Default choice - explains what happens step-by-step
-- **`high`**: Catches everything - animations, bugs, accessibility issues
+- **`low`**: Quick summary of what's in the video - good for getting an overview
+- **`auto`**: Default choice - explains what happens step-by-step with good detail
+- **`high`**: Detailed frame-by-frame analysis - best for animations, transitions, and visual details (limited to 5s recordings)
 
 ---
 
@@ -104,7 +104,7 @@ Add to `~/.claude.json`:
 | `record_and_analyze` | Record screen, then analyze | `mode` |
 | `select_record_and_analyze` | Select region + record + analyze | `mode` |
 
-All tools support optional `duration_seconds` (max 30s) and `custom_prompt` parameters.
+All tools support optional `duration_seconds` and `custom_prompt` parameters. Max duration depends on mode: 30s for low/auto, 5s for high.
 
 ---
 
@@ -173,10 +173,10 @@ This video demonstrates the checkout flow in an e-commerce iOS app.
 
 ### 3. `high` - Comprehensive Analysis
 
-**When to use:** Frame-by-frame analysis for animations, bugs, accessibility. Keep recordings short (1-3 seconds).
+**When to use:** Frame-by-frame analysis for animations, transitions, and visual details. Limited to 5 seconds max.
 
 ```
-Record my screen for 2 seconds and analyze with mode high
+Record my screen for 3 seconds and analyze with mode high
 ```
 
 **Output:**
@@ -184,45 +184,48 @@ Record my screen for 2 seconds and analyze with mode high
 ## Video Analysis Results
 
 ### Video Information
-- Duration: 2.0 seconds
+- Duration: 3.0 seconds
 - Resolution: 1170x2532
-- Frames Analyzed: 60
+- Frames Analyzed: 90
 
 ### Summary
-Modal presentation with spring animation. Found 1 animation issue and 2 accessibility concerns.
+Modal presentation with spring animation showing smooth motion and visual transitions.
 
 ### Detailed Frame Analysis
 **[0.00s - 0.17s]** (Frames 1-10)
-## ANIMATIONS
+## MOTION & TRANSITIONS
 - Animation begins with ease-out curve
 - Frame 1: Modal at y=2532 (off-screen)
 - Frame 10: Modal at y=1266 (50% visible)
 
 **[0.17s - 0.33s]** (Frames 11-20)
 - Spring overshoot detected - characteristic bounce
-- Frame 18: Modal at y=-42 (slight overshoot)
+- Frame 18: Modal overshoots slightly before settling
 
 **[0.33s - 0.50s]** (Frames 21-30)
-- Frame 24-25 shows 8px jump (possible dropped frame)
+## VISUAL DETAILS
+- Modal fully visible with shadow effect
+- Background dims to 50% opacity
+- Close button appears in top-right corner
 
-## ACCESSIBILITY
-1. **Insufficient Contrast**: Light gray text on white background
-2. **Small Touch Target**: Close button ~30x30pt (needs 44x44pt)
+## QUALITY OBSERVATIONS
+- Smooth 60fps animation throughout
+- Consistent visual hierarchy maintained
 ```
 
 ---
 
 ## Token Usage & Cost
 
-| Mode | Frames | Est. Input Tokens | Est. Cost |
-|------|--------|-------------------|-----------|
-| `low` | 2 | ~1,500 | ~$0.001 |
-| `auto` | 3 | ~2,500 | ~$0.003 |
-| `high` | 90 | ~90,000 | ~$0.05+ |
+| Mode | Typical Frames | Est. Input Tokens | Est. Cost |
+|------|----------------|-------------------|-----------|
+| `low` | 20-60 | ~20,000 | ~$0.002 |
+| `auto` | 40-120 | ~50,000 | ~$0.005 |
+| `high` | 90-150 | ~150,000 | ~$0.05+ |
 
 **Cost Control Tips:**
 1. Start with `low` to see if deeper analysis is needed
-2. For `high` mode, keep recordings under 3 seconds
+2. `high` mode is automatically limited to 5 seconds to control costs
 3. Use region selection to record only specific UI components
 
 ---
