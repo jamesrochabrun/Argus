@@ -213,6 +213,9 @@ public final class VideoFrameExtractor: Sendable {
 
       let base64String = jpegData.base64EncodedString()
 
+      // Debug: log image size and base64 length
+      print("[DEBUG] Frame \(index): size=\(cgImage.width)x\(cgImage.height), jpegBytes=\(jpegData.count), base64Chars=\(base64String.count)")
+
       return ExtractedFrame(
         base64Data: base64String,
         timestamp: CMTimeGetSeconds(actualTime),
