@@ -43,28 +43,28 @@ enum AnalysisMode: String {
           model: defaultVisionModel,
           maxTokensPerBatch: 800,
           systemPrompt: """
-            You are a QA engineer reviewing this \(context) for UI bugs. Scan for:
+            You are a visual observer providing detailed descriptions of this \(context). Describe what you see:
 
-            ## LAYOUT ISSUES
-            - Overlapping elements or text
-            - Incorrect spacing or alignment
-            - Elements cut off or overflowing
-            - Missing or broken images
+            ## VISUAL ELEMENTS
+            - UI components: buttons, text fields, labels, icons, images
+            - Layout: arrangement, spacing, alignment of elements
+            - Design: colors, typography, shadows, borders, corner radii
+            - Content: any text, numbers, or media visible
 
-            ## VISUAL BUGS
-            - Incorrect colors or contrast issues
-            - Missing UI elements (buttons, icons, labels)
-            - Broken or inconsistent styling
-            - Text truncation or rendering issues
+            ## MOTION & ANIMATION (if movement detected)
+            - Position changes between frames
+            - Opacity/fade transitions
+            - Scale, rotation, or transform effects
+            - Timing and easing characteristics
 
-            ## STATE PROBLEMS
-            - Incorrect loading states
-            - Error states not displayed properly
-            - Empty states missing or malformed
+            ## STATE & CONTEXT
+            - Current screen state and apparent purpose
+            - Interactive elements and their visual states
+            - Progress indicators, loading states, or feedback
+            - Visual hierarchy and focus areas
 
-            Report issues as: **[SEVERITY]** Issue description (location)
-            Severities: CRITICAL, HIGH, MEDIUM, LOW
-            If no issues found, state "No UI bugs detected."
+            Reference frames as: "Frame X shows..."
+            Describe objectively and thoroughly, like a designer or animator documenting their work.
             """,
           imageDetail: "low",
           temperature: 0.2
@@ -84,31 +84,28 @@ enum AnalysisMode: String {
           model: defaultVisionModel,
           maxTokensPerBatch: 2000,
           systemPrompt: """
-            You are a senior UI engineer performing detailed analysis of this \(context). Examine:
+            You are a visual observer providing detailed descriptions of this \(context). Describe what you see:
 
-            ## DESIGN-IMPLEMENTATION ALIGNMENT
-            - Do colors match expected values?
-            - Are fonts, sizes, weights correct?
-            - Is spacing consistent with design system?
-            - Are corner radii and shadows correct?
+            ## VISUAL ELEMENTS
+            - UI components: buttons, text fields, labels, icons, images
+            - Layout: arrangement, spacing, alignment of elements
+            - Design: colors, typography, shadows, borders, corner radii
+            - Content: any text, numbers, or media visible
 
-            ## PIXEL-LEVEL ISSUES
-            - Sub-pixel rendering artifacts
-            - Anti-aliasing problems
-            - Retina/display scaling issues
+            ## MOTION & ANIMATION (if movement detected)
+            - Position changes between frames
+            - Opacity/fade transitions
+            - Scale, rotation, or transform effects
+            - Timing and easing characteristics
 
-            ## ANIMATION MECHANICS (if applicable)
-            - Frame-by-frame position changes
-            - Opacity transitions and timing
-            - Transform origins and pivot points
+            ## STATE & CONTEXT
+            - Current screen state and apparent purpose
+            - Interactive elements and their visual states
+            - Progress indicators, loading states, or feedback
+            - Visual hierarchy and focus areas
 
-            ## ACCESSIBILITY CONCERNS
-            - Text contrast ratios
-            - Touch target sizes
-            - Focus indicators visibility
-
-            Reference frame numbers: "Frame X shows..."
-            Conclude with actionable fix recommendations.
+            Reference frames as: "Frame X shows..."
+            Describe objectively and thoroughly, like a designer or animator documenting their work.
             """,
           imageDetail: "high",
           temperature: 0.1
@@ -163,16 +160,34 @@ enum RecordingOrchestrator {
     let effectiveDuration: Int? = durationSeconds.map { min($0, maxDuration) }
 
     // Launch recording status UI
+    let logFile = URL(fileURLWithPath: "/tmp/argus-debug.log")
+    func debugLog(_ msg: String) {
+      let line = "[\(Date())] \(msg)\n"
+      FileHandle.standardError.write(line.data(using: .utf8)!)
+      if let handle = try? FileHandle(forWritingTo: logFile) {
+        handle.seekToEndOfFile()
+        handle.write(line.data(using: .utf8)!)
+        handle.closeFile()
+      } else {
+        FileManager.default.createFile(atPath: logFile.path, contents: line.data(using: .utf8))
+      }
+    }
+
+    debugLog("[Orchestrator] Creating status UI...")
     let statusUI = await MainActor.run { RecordingStatusUI() }
+    debugLog("[Orchestrator] Status UI instance created")
 
     // Try to launch UI (continue without it if it fails)
     let uiEvents: AsyncStream<RecordingStatusUI.UIEvent>?
     do {
+      debugLog("[Orchestrator] Launching status UI with duration: \(effectiveDuration.map { String($0) } ?? "nil")...")
       uiEvents = try await statusUI.launch(config: .init(durationSeconds: effectiveDuration))
+      debugLog("[Orchestrator] Status UI launched successfully, uiEvents is non-nil")
     } catch {
-      FileHandle.standardError.write("Warning: Could not launch recording status UI: \(error)\n".data(using: .utf8)!)
+      debugLog("[Orchestrator] ERROR: Could not launch recording status UI: \(error)")
       uiEvents = nil
     }
+    debugLog("[Orchestrator] Proceeding with recording, uiEvents is \(uiEvents == nil ? "nil" : "set")")
 
     var videoURL: URL?
 
@@ -500,9 +515,9 @@ struct ArgusMCPServer: AsyncParsableCommand {
       MCPTool(
         name: "analyze_video",
         description: """
-          Analyze a video file for UI bugs, animation quality, or design-implementation alignment.
-          Use to verify recorded UI interactions, validate animations against specs, or
-          catch visual bugs before deployment. Supports MP4, MOV, and other common formats.
+          Analyze a video file for detailed visual descriptions of UI content, animations, and design elements.
+          Use to document recorded interactions, describe animation sequences, or get frame-by-frame visual analysis.
+          Supports MP4, MOV, and other common formats.
           """,
         inputSchema: .object([
           "type": "object",
@@ -523,8 +538,8 @@ struct ArgusMCPServer: AsyncParsableCommand {
               "type": "string",
               "description": """
                 Analysis mode:
-                - 'low': UI Bug Detection (~$0.003) - Scan for layout issues, visual bugs. 4fps, max 30s.
-                - 'high': Detailed Analysis (~$0.01) - Pixel-level inspection for design alignment. 8fps, max 30s (150 frame cap).
+                - 'low': Quick Analysis (~$0.003) - Efficient visual description. 4fps, max 30s.
+                - 'high': Detailed Analysis (~$0.01) - Thorough visual description. 8fps, max 30s (150 frame cap).
                 """,
               "enum": .array(["low", "high"])
             ]),
@@ -540,9 +555,9 @@ struct ArgusMCPServer: AsyncParsableCommand {
       MCPTool(
         name: "record_and_analyze",
         description: """
-          Record screen and analyze for UI bugs, animation quality, or visual issues.
-          Perfect for testing UI changes, validating animations, or catching visual regressions
-          in your development workflow. Recording includes a visual status indicator.
+          Record screen and get detailed visual descriptions of the content.
+          Perfect for documenting UI interactions, describing animations, or capturing visual details
+          of your application. Recording includes a visual status indicator.
           """,
         inputSchema: .object([
           "type": "object",
@@ -555,8 +570,8 @@ struct ArgusMCPServer: AsyncParsableCommand {
               "type": "string",
               "description": """
                 Analysis mode:
-                - 'low': UI Bug Detection (~$0.003) - Scan for layout issues, visual bugs. 4fps, max 30s.
-                - 'high': Detailed Analysis (~$0.01) - Pixel-level inspection for design alignment. 8fps, max 30s (150 frame cap).
+                - 'low': Quick Analysis (~$0.003) - Efficient visual description. 4fps, max 30s.
+                - 'high': Detailed Analysis (~$0.01) - Thorough visual description. 8fps, max 30s (150 frame cap).
                 """,
               "enum": .array(["low", "high"])
             ]),
@@ -572,8 +587,8 @@ struct ArgusMCPServer: AsyncParsableCommand {
       MCPTool(
         name: "select_record_and_analyze",
         description: """
-          Select a screen region with visual crosshair, record it, and analyze.
-          Ideal for testing specific UI components - buttons, modals, form fields,
+          Select a screen region with visual crosshair, record it, and get detailed descriptions.
+          Ideal for documenting specific UI components - buttons, modals, form fields,
           or individual animations without recording the entire screen.
           """,
         inputSchema: .object([
@@ -587,8 +602,8 @@ struct ArgusMCPServer: AsyncParsableCommand {
               "type": "string",
               "description": """
                 Analysis mode:
-                - 'low': UI Bug Detection (~$0.003) - Scan for layout issues, visual bugs. 4fps, max 30s.
-                - 'high': Detailed Analysis (~$0.01) - Pixel-level inspection for design alignment. 8fps, max 30s (150 frame cap).
+                - 'low': Quick Analysis (~$0.003) - Efficient visual description. 4fps, max 30s.
+                - 'high': Detailed Analysis (~$0.01) - Thorough visual description. 8fps, max 30s (150 frame cap).
                 """,
               "enum": .array(["low", "high"])
             ]),
@@ -777,17 +792,36 @@ func handleRecordAndAnalyze(
   videoAnalyzer: VideoAnalyzer,
   screenRecorder: ScreenRecorder
 ) async throws -> String {
+  // Debug logging helper
+  func debugLog(_ msg: String) {
+    let line = "[\(Date())] \(msg)\n"
+    if let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: "/tmp/argus-debug.log")) {
+      handle.seekToEndOfFile()
+      handle.write(line.data(using: .utf8)!)
+      handle.closeFile()
+    } else {
+      FileManager.default.createFile(atPath: "/tmp/argus-debug.log", contents: line.data(using: .utf8))
+    }
+  }
+
+  debugLog("[handleRecordAndAnalyze] ENTERED")
+
   // Ensure clean state before starting new recording
   cleanupOrphanProcesses()
+  debugLog("[handleRecordAndAnalyze] cleanupOrphanProcesses done")
+
   await screenRecorder.forceReset()
+  debugLog("[handleRecordAndAnalyze] forceReset done")
 
   // Duration is optional: nil = manual mode, Int = timed mode (capped based on mode)
   let durationSeconds = arguments["duration_seconds"]?.intValue
   let mode = AnalysisMode(rawValue: arguments["mode"]?.stringValue ?? "low") ?? .low
   let effectiveDuration = durationSeconds.map { min($0, mode.maxDuration) } ?? mode.maxDuration
+  debugLog("[handleRecordAndAnalyze] Starting recording...")
 
   // Start recording
   let eventStream = try await screenRecorder.startRecordingWithEvents()
+  debugLog("[handleRecordAndAnalyze] Got eventStream, calling performRecording...")
   let recordingResult = try await RecordingOrchestrator.performRecording(
     eventStream: eventStream,
     durationSeconds: durationSeconds,
@@ -1099,17 +1133,37 @@ func handleSelectRecordAndAnalyze(
   videoAnalyzer: VideoAnalyzer,
   screenRecorder: ScreenRecorder
 ) async throws -> String {
+  // Debug logging helper
+  func debugLog(_ msg: String) {
+    let line = "[\(Date())] \(msg)\n"
+    if let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: "/tmp/argus-debug.log")) {
+      handle.seekToEndOfFile()
+      handle.write(line.data(using: .utf8)!)
+      handle.closeFile()
+    } else {
+      FileManager.default.createFile(atPath: "/tmp/argus-debug.log", contents: line.data(using: .utf8))
+    }
+  }
+
+  debugLog("[handleSelectRecordAndAnalyze] ENTERED")
+
   // Ensure clean state before starting new recording
   cleanupOrphanProcesses()
+  debugLog("[handleSelectRecordAndAnalyze] cleanupOrphanProcesses done")
+
   await screenRecorder.forceReset()
+  debugLog("[handleSelectRecordAndAnalyze] forceReset done")
 
   // Duration is optional: nil = manual mode, Int = timed mode (capped based on mode)
   let durationSeconds = arguments["duration_seconds"]?.intValue
   let mode = AnalysisMode(rawValue: arguments["mode"]?.stringValue ?? "low") ?? .low
   let effectiveDuration = durationSeconds.map { min($0, mode.maxDuration) } ?? mode.maxDuration
 
+  debugLog("[handleSelectRecordAndAnalyze] Launching region selector...")
+
   // First, launch the visual selector
   let selection = try await launchRegionSelector()
+  debugLog("[handleSelectRecordAndAnalyze] Region selected: \(selection.width)x\(selection.height)")
 
   if selection.cancelled {
     return """
@@ -1136,17 +1190,20 @@ func handleSelectRecordAndAnalyze(
   )
 
   // Start recording
+  debugLog("[handleSelectRecordAndAnalyze] Starting recording...")
   let eventStream = try await screenRecorder.startRecordingWithEvents(
     region: region,
     config: recordingConfig,
     outputPath: nil
   )
+  debugLog("[handleSelectRecordAndAnalyze] Got eventStream, calling performRecording...")
   let recordingResult = try await RecordingOrchestrator.performRecording(
     eventStream: eventStream,
     durationSeconds: durationSeconds,
     maxDuration: mode.maxDuration,
     screenRecorder: screenRecorder
   )
+  debugLog("[handleSelectRecordAndAnalyze] Recording complete")
 
   // Analyze video with cancellation support
   do {

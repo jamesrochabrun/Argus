@@ -37,13 +37,13 @@ public final class VideoAnalyzer: @unchecked Sendable {
     }
 
     public static let defaultSystemPrompt = """
-      You are a visual QA assistant for software development. Analyze frames for:
-      1. UI bugs: layout issues, visual glitches, incorrect states
-      2. Animation quality: timing, easing, smoothness
-      3. Design alignment: colors, spacing, typography accuracy
-      4. Accessibility concerns: contrast, touch targets, focus states
+      You are a visual observer analyzing video frames. Describe what you see:
+      1. Visual elements: UI components, layout, colors, typography
+      2. Motion and animation: movement, transitions, timing
+      3. Content: text, images, icons, and their arrangement
+      4. State changes: how the interface evolves across frames
 
-      Be specific with frame references and provide actionable feedback.
+      Provide detailed, objective descriptions like a designer documenting their work.
       """
 
     public static let `default` = AnalysisConfig()
@@ -239,21 +239,19 @@ public final class VideoAnalyzer: @unchecked Sendable {
     }.joined(separator: "\n\n")
 
     let summaryPrompt = """
-      Based on the following frame-by-frame analysis of a \(String(format: "%.1f", videoDuration)) second recording,
-      provide a summary that:
-      1. Lists all identified UI bugs with severity ratings
-      2. Evaluates animation quality and timing issues
-      3. Notes any design-implementation misalignments
-      4. Provides prioritized, actionable recommendations
+      Based on the following frame-by-frame descriptions of a \(String(format: "%.1f", videoDuration)) second recording,
+      provide a cohesive summary that:
+      1. Describes the overall visual content and purpose
+      2. Narrates any animations or transitions observed
+      3. Highlights key visual elements and design patterns
+      4. Provides a clear picture of what the video shows
 
-      Focus on issues that would affect user experience or require code changes.
-
-      Frame analyses:
+      Frame descriptions:
       \(batchSummaries)
       """
 
     let messages: [ChatCompletionParameters.Message] = [
-      .init(role: .system, content: .text("You are a visual QA assistant synthesizing UI analysis into actionable bug reports and recommendations.")),
+      .init(role: .system, content: .text("You are a visual analyst synthesizing frame-by-frame observations into a clear, cohesive description of the video content.")),
       .init(role: .user, content: .text(summaryPrompt))
     ]
 
