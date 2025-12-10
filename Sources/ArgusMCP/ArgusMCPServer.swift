@@ -221,11 +221,29 @@ enum RecordingOrchestrator {
                   for await uiEvent in uiEvents {
                     switch uiEvent {
                     case .stopClicked, .timeout:
+                      // User explicitly stopped or max duration reached
                       _ = try? await screenRecorder.stopRecording()
                       return
-                    case .ready, .processExited, .cancelClicked:
+                    case .processExited:
+                      // UI process terminated - only stop if in manual mode
+                      if effectiveDuration == nil {
+                        _ = try? await screenRecorder.stopRecording()
+                        return
+                      }
+                      // In timed mode, ignore and let timer handle it
+                      break
+                    case .ready, .cancelClicked:
                       break
                     }
+                  }
+                  // Stream finished without explicit stop - wait indefinitely
+                  // (timer task will handle stopping if in timed mode)
+                  if effectiveDuration != nil {
+                    // In timed mode, just wait - timer will stop recording
+                    try? await Task.sleep(for: .seconds(86400))
+                  } else {
+                    // In manual mode with no UI, stop recording
+                    _ = try? await screenRecorder.stopRecording()
                   }
                 }
 
