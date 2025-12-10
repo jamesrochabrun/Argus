@@ -37,14 +37,13 @@ public final class VideoAnalyzer: @unchecked Sendable {
     }
 
     public static let defaultSystemPrompt = """
-      You are an expert video analyst. You will receive frames from a video in sequence.
-      Analyze each frame carefully and provide:
-      1. A description of what's happening in each frame
-      2. Any important visual elements, text, or UI components
-      3. Changes between consecutive frames
-      4. Overall narrative or flow of the content
+      You are a visual QA assistant for software development. Analyze frames for:
+      1. UI bugs: layout issues, visual glitches, incorrect states
+      2. Animation quality: timing, easing, smoothness
+      3. Design alignment: colors, spacing, typography accuracy
+      4. Accessibility concerns: contrast, touch targets, focus states
 
-      Be concise but thorough. Focus on actionable insights.
+      Be specific with frame references and provide actionable feedback.
       """
 
     public static let `default` = AnalysisConfig()
@@ -71,6 +70,8 @@ public final class VideoAnalyzer: @unchecked Sendable {
     public let timestampRange: ClosedRange<Double>
     public let analysis: String
     public let tokensUsed: Int
+    public let promptTokens: Int
+    public let completionTokens: Int
   }
 
   /// Complete video analysis result
@@ -78,6 +79,8 @@ public final class VideoAnalyzer: @unchecked Sendable {
     public let batchResults: [BatchAnalysisResult]
     public let summary: String
     public let totalTokensUsed: Int
+    public let totalPromptTokens: Int
+    public let totalCompletionTokens: Int
     public let analysisTime: TimeInterval
     public let frameCount: Int
     public let videoDuration: Double
@@ -122,6 +125,8 @@ public final class VideoAnalyzer: @unchecked Sendable {
     // Process batches sequentially to avoid rate limits and maintain order
     var batchResults: [BatchAnalysisResult] = []
     var totalTokensUsed = 0
+    var totalPromptTokens = 0
+    var totalCompletionTokens = 0
 
     for (batchIndex, batch) in batches.enumerated() {
       // Check for cancellation before each batch
@@ -135,6 +140,8 @@ public final class VideoAnalyzer: @unchecked Sendable {
       )
       batchResults.append(result)
       totalTokensUsed += result.tokensUsed
+      totalPromptTokens += result.promptTokens
+      totalCompletionTokens += result.completionTokens
 
       let progress = Double(batchIndex + 1) / Double(batches.count)
       progressHandler?(progress * 0.9, "Processed \(batchIndex + 1)/\(batches.count) batches")
@@ -145,20 +152,24 @@ public final class VideoAnalyzer: @unchecked Sendable {
 
     // Generate summary from all batch analyses
     progressHandler?(0.95, "Generating summary...")
-    let (summary, summaryTokens) = try await generateSummary(
+    let summaryResult = try await generateSummary(
       batchResults: batchResults,
       config: config,
       videoDuration: extractionResult.videoDuration
     )
-    totalTokensUsed += summaryTokens
+    totalTokensUsed += summaryResult.totalTokens
+    totalPromptTokens += summaryResult.promptTokens
+    totalCompletionTokens += summaryResult.completionTokens
 
     let analysisTime = Date().timeIntervalSince(startTime)
     progressHandler?(1.0, "Analysis complete")
 
     return VideoAnalysisResult(
       batchResults: batchResults,
-      summary: summary,
+      summary: summaryResult.summary,
       totalTokensUsed: totalTokensUsed,
+      totalPromptTokens: totalPromptTokens,
+      totalCompletionTokens: totalCompletionTokens,
       analysisTime: analysisTime,
       frameCount: frames.count,
       videoDuration: extractionResult.videoDuration
@@ -204,12 +215,17 @@ public final class VideoAnalyzer: @unchecked Sendable {
     let analysis = response.choices?.first?.message?.content ?? "No analysis generated"
     let tokensUsed = response.usage?.totalTokens ?? 0
 
+    let promptTokens = response.usage?.promptTokens ?? 0
+    let completionTokens = response.usage?.completionTokens ?? 0
+
     return BatchAnalysisResult(
       batchIndex: batchIndex,
       frameRange: firstFrame.index...lastFrame.index,
       timestampRange: firstFrame.timestamp...lastFrame.timestamp,
       analysis: analysis,
-      tokensUsed: tokensUsed
+      tokensUsed: tokensUsed,
+      promptTokens: promptTokens,
+      completionTokens: completionTokens
     )
   }
 
@@ -217,25 +233,27 @@ public final class VideoAnalyzer: @unchecked Sendable {
     batchResults: [BatchAnalysisResult],
     config: AnalysisConfig,
     videoDuration: Double
-  ) async throws -> (String, Int) {
+  ) async throws -> (summary: String, totalTokens: Int, promptTokens: Int, completionTokens: Int) {
     let batchSummaries = batchResults.map { result in
       "[\(String(format: "%.1f", result.timestampRange.lowerBound))s - \(String(format: "%.1f", result.timestampRange.upperBound))s]: \(result.analysis)"
     }.joined(separator: "\n\n")
 
     let summaryPrompt = """
-      Based on the following frame-by-frame analysis of a \(String(format: "%.1f", videoDuration)) second video,
-      provide a comprehensive summary that:
-      1. Describes the overall content and purpose of the video
-      2. Highlights key moments and transitions
-      3. Notes any important text, UI elements, or visual information
-      4. Provides actionable insights or conclusions
+      Based on the following frame-by-frame analysis of a \(String(format: "%.1f", videoDuration)) second recording,
+      provide a summary that:
+      1. Lists all identified UI bugs with severity ratings
+      2. Evaluates animation quality and timing issues
+      3. Notes any design-implementation misalignments
+      4. Provides prioritized, actionable recommendations
+
+      Focus on issues that would affect user experience or require code changes.
 
       Frame analyses:
       \(batchSummaries)
       """
 
     let messages: [ChatCompletionParameters.Message] = [
-      .init(role: .system, content: .text("You are an expert at synthesizing video analysis into clear, actionable summaries.")),
+      .init(role: .system, content: .text("You are a visual QA assistant synthesizing UI analysis into actionable bug reports and recommendations.")),
       .init(role: .user, content: .text(summaryPrompt))
     ]
 
@@ -249,8 +267,10 @@ public final class VideoAnalyzer: @unchecked Sendable {
     let response = try await openAIService.startChat(parameters: parameters)
     let summary = response.choices?.first?.message?.content ?? "No summary generated"
     let tokensUsed = response.usage?.totalTokens ?? 0
+    let promptTokens = response.usage?.promptTokens ?? 0
+    let completionTokens = response.usage?.completionTokens ?? 0
 
-    return (summary, tokensUsed)
+    return (summary, tokensUsed, promptTokens, completionTokens)
   }
 
   public enum AnalysisError: Error, LocalizedError {

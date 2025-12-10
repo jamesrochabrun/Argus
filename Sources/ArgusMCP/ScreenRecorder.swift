@@ -647,9 +647,13 @@ public actor ScreenRecorder {
     // Finish writing
     videoInput?.markAsFinished()
 
-    await withCheckedContinuation { continuation in
-      assetWriter?.finishWriting {
-        continuation.resume()
+    // Only wait for finishWriting if we have an active asset writer
+    // Without this check, if assetWriter is nil the continuation is never resumed (leak!)
+    if let writer = assetWriter {
+      await withCheckedContinuation { continuation in
+        writer.finishWriting {
+          continuation.resume()
+        }
       }
     }
 

@@ -17,16 +17,13 @@ public let defaultVisionModel = "gpt-4o-mini"
 /// Analysis quality modes with their associated configurations
 enum AnalysisMode: String {
   case low
-  case auto
   case high
 
   /// Maximum recording duration in seconds for this mode
   var maxDuration: Int {
     switch self {
-    case .low, .auto:
-      return 30  // Full 30 seconds for low/auto modes
-    case .high:
-      return 5   // Limited to ~5 seconds for high mode (120 frames at 30fps)
+    case .low, .high:
+      return 30  // All modes support 30 seconds (high mode caps at 150 frames)
     }
   }
 
@@ -44,41 +41,39 @@ enum AnalysisMode: String {
         analysis: VideoAnalyzer.AnalysisConfig(
           batchSize: 8,
           model: defaultVisionModel,
-          maxTokensPerBatch: 500,
-          systemPrompt: "Provide a quick, concise summary of what happens in this \(context). Focus on the main content, key actions, and notable moments.",
-          imageDetail: "low",
-          temperature: 0.3
-        ),
-        extraction: VideoFrameExtractor.ExtractionConfig(
-          framesPerSecond: 2.0,
-          maxFrames: 60,
-          targetWidth: 512,
-          compressionQuality: 0.7
-        )
-      )
-
-    case .auto:
-      return (
-        analysis: VideoAnalyzer.AnalysisConfig(
-          batchSize: 5,
-          model: defaultVisionModel,
-          maxTokensPerBatch: 1500,
+          maxTokensPerBatch: 800,
           systemPrompt: """
-            Analyze this \(context) in detail. Describe:
-            1. The overall content, setting, and context
-            2. Key actions, events, and transitions as they occur
-            3. Important visual elements, text, and information displayed
-            4. The purpose and outcome of what's being shown
-            Be thorough and clear in your explanation.
+            You are a QA engineer reviewing this \(context) for UI bugs. Scan for:
+
+            ## LAYOUT ISSUES
+            - Overlapping elements or text
+            - Incorrect spacing or alignment
+            - Elements cut off or overflowing
+            - Missing or broken images
+
+            ## VISUAL BUGS
+            - Incorrect colors or contrast issues
+            - Missing UI elements (buttons, icons, labels)
+            - Broken or inconsistent styling
+            - Text truncation or rendering issues
+
+            ## STATE PROBLEMS
+            - Incorrect loading states
+            - Error states not displayed properly
+            - Empty states missing or malformed
+
+            Report issues as: **[SEVERITY]** Issue description (location)
+            Severities: CRITICAL, HIGH, MEDIUM, LOW
+            If no issues found, state "No UI bugs detected."
             """,
-          imageDetail: "auto",
-          temperature: 0.3
+          imageDetail: "low",
+          temperature: 0.2
         ),
         extraction: VideoFrameExtractor.ExtractionConfig(
           framesPerSecond: 4.0,
           maxFrames: 120,
-          targetWidth: 1024,
-          compressionQuality: 0.8
+          targetWidth: 512,
+          compressionQuality: 0.6
         )
       )
 
@@ -89,40 +84,39 @@ enum AnalysisMode: String {
           model: defaultVisionModel,
           maxTokensPerBatch: 2000,
           systemPrompt: """
-            You are an expert analyst performing comprehensive frame-by-frame analysis of this \(context). Examine each frame carefully and provide detailed observations on:
+            You are a senior UI engineer performing detailed analysis of this \(context). Examine:
 
-            ## MOTION & TRANSITIONS
-            - How elements move, appear, or change between frames
-            - Smoothness and fluidity of any animations or transitions
-            - Timing and pacing of visual changes
+            ## DESIGN-IMPLEMENTATION ALIGNMENT
+            - Do colors match expected values?
+            - Are fonts, sizes, weights correct?
+            - Is spacing consistent with design system?
+            - Are corner radii and shadows correct?
 
-            ## VISUAL DETAILS
-            - Layout, composition, and visual hierarchy
-            - Text content, readability, and formatting
-            - Colors, contrast, and visual consistency
-            - Any visual anomalies, glitches, or unexpected elements
+            ## PIXEL-LEVEL ISSUES
+            - Sub-pixel rendering artifacts
+            - Anti-aliasing problems
+            - Retina/display scaling issues
 
-            ## CONTENT & CONTEXT
-            - What is being shown and its apparent purpose
-            - Key information, data, or messages displayed
-            - User interactions or actions being performed
-            - State changes and their effects
+            ## ANIMATION MECHANICS (if applicable)
+            - Frame-by-frame position changes
+            - Opacity transitions and timing
+            - Transform origins and pivot points
 
-            ## QUALITY OBSERVATIONS
-            - Overall visual quality and clarity
-            - Areas that stand out (positively or negatively)
-            - Anything unusual or noteworthy
+            ## ACCESSIBILITY CONCERNS
+            - Text contrast ratios
+            - Touch target sizes
+            - Focus indicators visibility
 
-            Reference specific frame numbers and timestamps when describing observations.
-            Provide actionable insights and highlight anything significant.
+            Reference frame numbers: "Frame X shows..."
+            Conclude with actionable fix recommendations.
             """,
           imageDetail: "high",
           temperature: 0.1
         ),
         extraction: VideoFrameExtractor.ExtractionConfig(
-          framesPerSecond: 30.0,
-          maxFrames: min(effectiveDuration * 30, 150),
-          targetWidth: 1280,
+          framesPerSecond: 8.0,
+          maxFrames: 150,
+          targetWidth: 896,
           compressionQuality: 0.85
         )
       )
@@ -506,9 +500,9 @@ struct ArgusMCPServer: AsyncParsableCommand {
       MCPTool(
         name: "analyze_video",
         description: """
-          Analyze a video file by extracting frames and sending them to OpenAI's Vision API.
-          Returns a detailed description of the video content including key moments, UI elements,
-          text, and transitions. Supports various video formats (MP4, MOV, AVI, etc.).
+          Analyze a video file for UI bugs, animation quality, or design-implementation alignment.
+          Use to verify recorded UI interactions, validate animations against specs, or
+          catch visual bugs before deployment. Supports MP4, MOV, and other common formats.
           """,
         inputSchema: .object([
           "type": "object",
@@ -519,21 +513,20 @@ struct ArgusMCPServer: AsyncParsableCommand {
             ]),
             "frames_per_second": .object([
               "type": "number",
-              "description": "Number of frames to extract per second (default: 1.0)"
+              "description": "Number of frames to extract per second (default varies by mode)"
             ]),
             "max_frames": .object([
               "type": "integer",
-              "description": "Maximum number of frames to extract (default: 30)"
+              "description": "Maximum number of frames to extract (default varies by mode)"
             ]),
             "mode": .object([
               "type": "string",
               "description": """
-                Analysis quality level:
-                - 'low': Fast overview (~$0.001) - Quick summary, up to 60 frames at 2fps, max 30s recording
-                - 'auto': Balanced detail (~$0.003) - Good for most tasks, up to 120 frames at 4fps, max 30s recording
-                - 'high': Comprehensive analysis (~$0.05+, ⚠️ higher cost) - Frame-by-frame at 30fps, max 5s recording, catches animations and visual details
+                Analysis mode:
+                - 'low': UI Bug Detection (~$0.003) - Scan for layout issues, visual bugs. 4fps, max 30s.
+                - 'high': Detailed Analysis (~$0.01) - Pixel-level inspection for design alignment. 8fps, max 30s (150 frame cap).
                 """,
-              "enum": .array(["low", "auto", "high"])
+              "enum": .array(["low", "high"])
             ]),
             "custom_prompt": .object([
               "type": "string",
@@ -547,26 +540,25 @@ struct ArgusMCPServer: AsyncParsableCommand {
       MCPTool(
         name: "record_and_analyze",
         description: """
-          Start a screen recording, wait for the specified duration, stop recording,
-          and automatically analyze the recorded video. This is a convenience tool that
-          combines screen recording and video analysis into a single operation.
+          Record screen and analyze for UI bugs, animation quality, or visual issues.
+          Perfect for testing UI changes, validating animations, or catching visual regressions
+          in your development workflow. Recording includes a visual status indicator.
           """,
         inputSchema: .object([
           "type": "object",
           "properties": .object([
             "duration_seconds": .object([
               "type": "integer",
-              "description": "Duration to record in seconds. If not provided, recording runs until user clicks Stop (max depends on mode: 30s for low/auto, 5s for high)."
+              "description": "Duration to record in seconds. If not provided, recording runs until user clicks Stop (max 30s for all modes)."
             ]),
             "mode": .object([
               "type": "string",
               "description": """
-                Analysis quality level:
-                - 'low': Fast overview (~$0.001) - Quick summary, max 30s recording
-                - 'auto': Balanced detail (~$0.003) - Good for most tasks, max 30s recording
-                - 'high': Comprehensive analysis (~$0.05+, ⚠️ higher cost) - Frame-by-frame at 30fps, max 5s recording
+                Analysis mode:
+                - 'low': UI Bug Detection (~$0.003) - Scan for layout issues, visual bugs. 4fps, max 30s.
+                - 'high': Detailed Analysis (~$0.01) - Pixel-level inspection for design alignment. 8fps, max 30s (150 frame cap).
                 """,
-              "enum": .array(["low", "auto", "high"])
+              "enum": .array(["low", "high"])
             ]),
             "custom_prompt": .object([
               "type": "string",
@@ -580,26 +572,25 @@ struct ArgusMCPServer: AsyncParsableCommand {
       MCPTool(
         name: "select_record_and_analyze",
         description: """
-          Opens a visual crosshair overlay to select a specific screen region, then records
-          that region for a specified duration and analyzes it. Perfect for testing specific
-          UI components without recording the entire screen.
+          Select a screen region with visual crosshair, record it, and analyze.
+          Ideal for testing specific UI components - buttons, modals, form fields,
+          or individual animations without recording the entire screen.
           """,
         inputSchema: .object([
           "type": "object",
           "properties": .object([
             "duration_seconds": .object([
               "type": "integer",
-              "description": "Duration to record in seconds. If not provided, recording runs until user clicks Stop (max depends on mode: 30s for low/auto, 5s for high)."
+              "description": "Duration to record in seconds. If not provided, recording runs until user clicks Stop (max 30s for all modes)."
             ]),
             "mode": .object([
               "type": "string",
               "description": """
-                Analysis quality level:
-                - 'low': Fast overview (~$0.001) - Quick summary, max 30s recording
-                - 'auto': Balanced detail (~$0.003) - Good for most tasks, max 30s recording
-                - 'high': Comprehensive analysis (~$0.05+, ⚠️ higher cost) - Frame-by-frame at 30fps, max 5s recording
+                Analysis mode:
+                - 'low': UI Bug Detection (~$0.003) - Scan for layout issues, visual bugs. 4fps, max 30s.
+                - 'high': Detailed Analysis (~$0.01) - Pixel-level inspection for design alignment. 8fps, max 30s (150 frame cap).
                 """,
-              "enum": .array(["low", "auto", "high"])
+              "enum": .array(["low", "high"])
             ]),
             "custom_prompt": .object([
               "type": "string",
@@ -732,8 +723,8 @@ func handleAnalyzeVideo(
   let effectiveDuration = Int(CMTimeGetSeconds(duration))
 
   // Parse mode and get configs from centralized source
-  let modeString = arguments["mode"]?.stringValue ?? "auto"
-  let mode = AnalysisMode(rawValue: modeString) ?? .auto
+  let modeString = arguments["mode"]?.stringValue ?? "low"
+  let mode = AnalysisMode(rawValue: modeString) ?? .low
   var (analysisConfig, extractionConfig) = mode.configs(context: "video", effectiveDuration: effectiveDuration)
 
   // Apply user overrides for extraction config if provided
@@ -792,7 +783,7 @@ func handleRecordAndAnalyze(
 
   // Duration is optional: nil = manual mode, Int = timed mode (capped based on mode)
   let durationSeconds = arguments["duration_seconds"]?.intValue
-  let mode = AnalysisMode(rawValue: arguments["mode"]?.stringValue ?? "auto") ?? .auto
+  let mode = AnalysisMode(rawValue: arguments["mode"]?.stringValue ?? "low") ?? .low
   let effectiveDuration = durationSeconds.map { min($0, mode.maxDuration) } ?? mode.maxDuration
 
   // Start recording
@@ -865,7 +856,7 @@ func handleRecordSimulatorAndAnalyze(
 
   // Duration is optional: nil = manual mode, Int = timed mode (capped based on mode)
   let durationSeconds = arguments["duration_seconds"]?.intValue
-  let mode = AnalysisMode(rawValue: arguments["mode"]?.stringValue ?? "auto") ?? .auto
+  let mode = AnalysisMode(rawValue: arguments["mode"]?.stringValue ?? "low") ?? .low
   let effectiveDuration = durationSeconds.map { min($0, mode.maxDuration) } ?? mode.maxDuration
 
   // Configure recording for simulator (60fps for animations)
@@ -955,7 +946,7 @@ func handleRecordAppAndAnalyze(
 
   // Duration is optional: nil = manual mode, Int = timed mode (capped based on mode)
   let durationSeconds = arguments["duration_seconds"]?.intValue
-  let mode = AnalysisMode(rawValue: arguments["mode"]?.stringValue ?? "auto") ?? .auto
+  let mode = AnalysisMode(rawValue: arguments["mode"]?.stringValue ?? "low") ?? .low
   let effectiveDuration = durationSeconds.map { min($0, mode.maxDuration) } ?? mode.maxDuration
 
   // Configure recording for app window (60fps for animations)
@@ -1114,7 +1105,7 @@ func handleSelectRecordAndAnalyze(
 
   // Duration is optional: nil = manual mode, Int = timed mode (capped based on mode)
   let durationSeconds = arguments["duration_seconds"]?.intValue
-  let mode = AnalysisMode(rawValue: arguments["mode"]?.stringValue ?? "auto") ?? .auto
+  let mode = AnalysisMode(rawValue: arguments["mode"]?.stringValue ?? "low") ?? .low
   let effectiveDuration = durationSeconds.map { min($0, mode.maxDuration) } ?? mode.maxDuration
 
   // First, launch the visual selector
@@ -1225,7 +1216,7 @@ func formatAnalysisResult(
     ### Analysis Statistics
     - Frames Analyzed: \(analysis.frameCount)
     - Batches Processed: \(analysis.batchResults.count)
-    - Total Tokens Used: \(analysis.totalTokensUsed)
+    - Tokens: \(analysis.totalTokensUsed) total (\(analysis.totalPromptTokens) input / \(analysis.totalCompletionTokens) output)
     - Extraction Time: \(String(format: "%.2f", extraction.extractionTime)) seconds
     - Analysis Time: \(String(format: "%.2f", analysis.analysisTime)) seconds
 
