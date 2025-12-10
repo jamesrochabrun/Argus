@@ -2,7 +2,7 @@
 
 <img width="2058" height="830" alt="Image" src="https://github.com/user-attachments/assets/8fd7f2fe-612a-42eb-b97e-7e54869cd383" />
 
-A MCP (Model Context Protocol) server for video analysis using OpenAI's Vision API. Argus extracts frames from videos and analyzes them.
+A MCP (Model Context Protocol) server for visual QA using OpenAI's Vision API. Argus records your screen, extracts frames, and analyzes them for UI bugs, animation issues, and design-implementation misalignments.
 
 ## Quick Install
 
@@ -82,17 +82,15 @@ Add to `~/.claude.json`:
 
 ## Analysis Modes
 
-| Mode | Description | FPS | Max Frames | Max Duration | Resolution | Est. Cost |
-|------|-------------|-----|------------|--------------|------------|-----------|
-| `low` | Fast overview, quick summary | 2.0 | 60 | 30s | 512px | ~$0.002 |
-| `auto` | Balanced detail, good for most tasks | 4.0 | 120 | 30s | 1024px | ~$0.005 |
-| `high` | Comprehensive frame-by-frame analysis | 30.0 | 150 | 5s | 1280px | ~$0.05+ |
+| Mode | Purpose | FPS | Max Duration | Resolution | Est. Cost |
+|------|---------|-----|--------------|------------|-----------|
+| `low` | UI Bug Detection | 4 | 30s | 512px | ~$0.003 |
+| `high` | Detailed Analysis | 8 | 30s | 896px | ~$0.01 |
 
 ### Choosing the Right Mode
 
-- **`low`**: Quick summary of what's in the video - good for getting an overview
-- **`auto`**: Default choice - explains what happens step-by-step with good detail
-- **`high`**: Detailed frame-by-frame analysis - best for animations, transitions, and visual details (limited to 5s recordings)
+- **`low`**: Scan for layout issues, visual bugs, text truncation, overlapping elements. Best for quick QA checks.
+- **`high`**: Pixel-level inspection for design-implementation alignment, accessibility concerns, and animation mechanics.
 
 ---
 
@@ -100,22 +98,22 @@ Add to `~/.claude.json`:
 
 | Tool | Description | Required |
 |------|-------------|----------|
-| `analyze_video` | Analyze a video file with specified mode | `video_path` |
-| `record_and_analyze` | Record screen, then analyze | `mode` |
-| `select_record_and_analyze` | Select region + record + analyze | `mode` |
+| `analyze_video` | Analyze an existing video file for UI bugs | `video_path` |
+| `record_and_analyze` | Record screen and analyze for visual issues | `mode` |
+| `select_record_and_analyze` | Select region with crosshair, record, and analyze | `mode` |
 
-All tools support optional `duration_seconds` and `custom_prompt` parameters. Max duration depends on mode: 30s for low/auto, 5s for high.
+All tools support optional `duration_seconds` (max 30s) and `custom_prompt` parameters.
 
 ---
 
 ## Mode Examples
 
-### 1. `low` - Fast Overview
+### 1. `low` - UI Bug Detection
 
-**When to use:** Quick summary without detailed analysis.
+**When to use:** Quick scan for layout issues, visual bugs, and broken UI states.
 
 ```
-Analyze the video at /path/to/demo.mp4 with mode low
+Record my screen for 3 seconds and analyze with mode low
 ```
 
 **Output:**
@@ -123,57 +121,31 @@ Analyze the video at /path/to/demo.mp4 with mode low
 ## Video Analysis Results
 
 ### Video Information
-- Duration: 12.5 seconds
+- Duration: 3.0 seconds
 - Resolution: 1920x1080
-- Frames Analyzed: 6
+- Frames Analyzed: 12
 
 ### Summary
-The video shows a mobile app login flow. A user enters credentials, taps the
-login button, sees a loading spinner, and is taken to a home dashboard.
-```
+**[MEDIUM]** Text truncation in terminal output - last line cut off
+**[LOW]** Overlapping notification banner with main content
+**[LOW]** Inconsistent spacing between list items
 
----
-
-### 2. `auto` - Balanced Analysis
-
-**When to use:** Thorough explanation of everything that happens.
-
-```
-Analyze the video at /path/to/tutorial.mp4 with mode auto
-```
-
-**Output:**
-```
-## Video Analysis Results
-
-### Video Information
-- Duration: 8.2 seconds
-- Resolution: 1170x2532
-- Frames Analyzed: 8
-
-### Summary
-This video demonstrates the checkout flow in an e-commerce iOS app.
+No critical issues detected.
 
 ### Detailed Frame Analysis
-**[0.0s - 4.0s]**
-1. Shopping cart with 3 items listed vertically
-2. Each item shows: thumbnail, name/size, price
-3. User taps green "Checkout" button
-4. Slide-up animation reveals payment sheet
+**[0.0s - 1.5s]**
+- Text truncation observed (Frame 3)
+- Notification overlap detected (Frame 1-8)
 
-**[4.0s - 8.2s]**
-1. Payment sheet shows: Apple Pay, Credit Card, PayPal
-2. User selects Apple Pay
-3. Face ID prompt appears
-4. Success animation with confetti
-5. Order confirmation screen
+**[1.5s - 3.0s]**
+- Spacing inconsistency in sidebar (Frame 10)
 ```
 
 ---
 
-### 3. `high` - Comprehensive Analysis
+### 2. `high` - Detailed Analysis
 
-**When to use:** Frame-by-frame analysis for animations, transitions, and visual details. Limited to 5 seconds max.
+**When to use:** Design-implementation alignment, accessibility review, animation mechanics.
 
 ```
 Record my screen for 3 seconds and analyze with mode high
@@ -185,32 +157,27 @@ Record my screen for 3 seconds and analyze with mode high
 
 ### Video Information
 - Duration: 3.0 seconds
-- Resolution: 1170x2532
-- Frames Analyzed: 90
+- Resolution: 1920x1080
+- Frames Analyzed: 24
 
 ### Summary
-Modal presentation with spring animation showing smooth motion and visual transitions.
+#### Design-Implementation Issues
+- Color contrast insufficient for body text (#666 on #fff = 5.7:1, needs 7:1 for AAA)
+- Button corner radius 4px, design spec shows 8px
+- Focus indicator not visible on keyboard navigation
 
-### Detailed Frame Analysis
-**[0.00s - 0.17s]** (Frames 1-10)
-## MOTION & TRANSITIONS
-- Animation begins with ease-out curve
-- Frame 1: Modal at y=2532 (off-screen)
-- Frame 10: Modal at y=1266 (50% visible)
+#### Animation Mechanics
+- Modal slide-up uses ease-out curve, smooth 60fps
+- Spring overshoot at Frame 18 matches design intent
 
-**[0.17s - 0.33s]** (Frames 11-20)
-- Spring overshoot detected - characteristic bounce
-- Frame 18: Modal overshoots slightly before settling
+#### Accessibility Concerns
+- Touch targets on icons are 36x36px (below 44px minimum)
+- Missing aria-labels on action buttons
 
-**[0.33s - 0.50s]** (Frames 21-30)
-## VISUAL DETAILS
-- Modal fully visible with shadow effect
-- Background dims to 50% opacity
-- Close button appears in top-right corner
-
-## QUALITY OBSERVATIONS
-- Smooth 60fps animation throughout
-- Consistent visual hierarchy maintained
+### Actionable Recommendations
+1. Increase text contrast ratio to meet WCAG AAA
+2. Update corner radius to match design system
+3. Add visible focus indicators for keyboard users
 ```
 
 ---
@@ -219,13 +186,12 @@ Modal presentation with spring animation showing smooth motion and visual transi
 
 | Mode | Typical Frames | Est. Input Tokens | Est. Cost |
 |------|----------------|-------------------|-----------|
-| `low` | 20-60 | ~20,000 | ~$0.002 |
-| `auto` | 40-120 | ~50,000 | ~$0.005 |
-| `high` | 90-150 | ~150,000 | ~$0.05+ |
+| `low` | 12-120 | ~25,000-40,000 | ~$0.003 |
+| `high` | 24-240 | ~500,000-800,000 | ~$0.01+ |
 
 **Cost Control Tips:**
-1. Start with `low` to see if deeper analysis is needed
-2. `high` mode is automatically limited to 5 seconds to control costs
+1. Start with `low` mode for most QA tasks - it catches common UI bugs
+2. Use `high` mode only when you need design-implementation verification
 3. Use region selection to record only specific UI components
 
 ---
