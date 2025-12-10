@@ -172,19 +172,32 @@ public final class RecordingStatusUI {
 
   private func getExecutablePath() throws -> String {
     // Check common locations for argus-status executable
+    FileHandle.standardError.write("[DEBUG] Looking for argus-status executable...\n".data(using: .utf8)!)
 
     // 1. Same directory as argus-mcp executable (for CLI tools, Bundle.main.executablePath is the path)
     if let execPath = Bundle.main.executablePath {
       let execDir = (execPath as NSString).deletingLastPathComponent
       let siblingPath = execDir + "/argus-status"
+      FileHandle.standardError.write("[DEBUG] Checking sibling path: \(siblingPath)\n".data(using: .utf8)!)
       if FileManager.default.fileExists(atPath: siblingPath) {
+        FileHandle.standardError.write("[DEBUG] Found at sibling path!\n".data(using: .utf8)!)
         return siblingPath
       }
     }
 
-    // 2. Check relative to current working directory's .build/debug
+    // 2. Check relative to current working directory's .build/release (production)
+    let cwdReleasePath = FileManager.default.currentDirectoryPath + "/.build/release/argus-status"
+    FileHandle.standardError.write("[DEBUG] Checking release path: \(cwdReleasePath)\n".data(using: .utf8)!)
+    if FileManager.default.fileExists(atPath: cwdReleasePath) {
+      FileHandle.standardError.write("[DEBUG] Found at release path!\n".data(using: .utf8)!)
+      return cwdReleasePath
+    }
+
+    // 3. Check relative to current working directory's .build/debug
     let cwdBuildPath = FileManager.default.currentDirectoryPath + "/.build/debug/argus-status"
+    FileHandle.standardError.write("[DEBUG] Checking debug path: \(cwdBuildPath)\n".data(using: .utf8)!)
     if FileManager.default.fileExists(atPath: cwdBuildPath) {
+      FileHandle.standardError.write("[DEBUG] Found at debug path!\n".data(using: .utf8)!)
       return cwdBuildPath
     }
 
@@ -245,6 +258,7 @@ public final class RecordingStatusUI {
 
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
       let fileHandle = outputPipe.fileHandleForReading
+      var buffer = Data()
 
       while true {
         let data = fileHandle.availableData
@@ -253,20 +267,28 @@ public final class RecordingStatusUI {
           return
         }
 
-        // Parse JSON response
-        if let response = try? JSONDecoder().decode(StatusResponse.self, from: data) {
-          Task { @MainActor [weak self] in
-            switch response.type {
-            case .ready:
-              self?.eventContinuation?.yield(.ready)
-            case .stopClicked:
-              self?.eventContinuation?.yield(.stopClicked)
-            case .timeout:
-              self?.eventContinuation?.yield(.timeout)
-            case .cancelClicked:
-              // Yield to BOTH continuations so analysis phase can receive cancel events
-              self?.eventContinuation?.yield(.cancelClicked)
-              self?.analysisContinuation?.yield(.cancelClicked)
+        buffer.append(data)
+
+        // Process complete lines (newline-delimited JSON)
+        while let newlineIndex = buffer.firstIndex(of: UInt8(ascii: "\n")) {
+          let lineData = Data(buffer.prefix(upTo: newlineIndex))
+          buffer = Data(buffer.suffix(from: buffer.index(after: newlineIndex)))
+
+          // Parse JSON response from this line
+          if let response = try? JSONDecoder().decode(StatusResponse.self, from: lineData) {
+            Task { @MainActor [weak self] in
+              switch response.type {
+              case .ready:
+                self?.eventContinuation?.yield(.ready)
+              case .stopClicked:
+                self?.eventContinuation?.yield(.stopClicked)
+              case .timeout:
+                self?.eventContinuation?.yield(.timeout)
+              case .cancelClicked:
+                // Yield to BOTH continuations so analysis phase can receive cancel events
+                self?.eventContinuation?.yield(.cancelClicked)
+                self?.analysisContinuation?.yield(.cancelClicked)
+              }
             }
           }
         }
