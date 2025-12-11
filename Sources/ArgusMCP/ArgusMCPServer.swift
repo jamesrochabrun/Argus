@@ -151,14 +151,13 @@ struct StatusUIResult: Codable {
 /// Handle to a running status UI process, allowing us to signal completion
 class StatusUIHandle {
   let process: Process
-  let inputPipe: Pipe
   let outputPipe: Pipe
-  private var resultData: Data?
+  let signalFilePath: String
 
-  init(process: Process, inputPipe: Pipe, outputPipe: Pipe) {
+  init(process: Process, outputPipe: Pipe, signalFilePath: String) {
     self.process = process
-    self.inputPipe = inputPipe
     self.outputPipe = outputPipe
+    self.signalFilePath = signalFilePath
   }
 
   /// Read the status result from stdout (call after recording phase completes)
@@ -173,16 +172,14 @@ class StatusUIHandle {
     return result
   }
 
-  /// Signal that analysis completed successfully
+  /// Signal that analysis completed successfully (via file)
   func signalSuccess() {
-    inputPipe.fileHandleForWriting.write("success\n".data(using: .utf8)!)
-    try? inputPipe.fileHandleForWriting.close()
+    try? "success".write(toFile: signalFilePath, atomically: true, encoding: .utf8)
   }
 
-  /// Signal that analysis failed with an error
+  /// Signal that analysis failed with an error (via file)
   func signalError() {
-    inputPipe.fileHandleForWriting.write("error\n".data(using: .utf8)!)
-    try? inputPipe.fileHandleForWriting.close()
+    try? "error".write(toFile: signalFilePath, atomically: true, encoding: .utf8)
   }
 
   /// Wait for the status UI process to exit
@@ -195,6 +192,8 @@ class StatusUIHandle {
     if process.isRunning {
       process.terminate()
     }
+    // Clean up signal file
+    try? FileManager.default.removeItem(atPath: signalFilePath)
   }
 }
 
@@ -206,10 +205,13 @@ func launchStatusUI(durationSeconds: Int?) throws -> StatusUIHandle {
     throw ToolError.invalidArgument("Cannot find own executable path")
   }
 
+  // Generate unique signal file path for this session
+  let signalFilePath = "/tmp/argus-signal-\(UUID().uuidString).txt"
+
   let process = Process()
   process.executableURL = URL(fileURLWithPath: executablePath)
 
-  var args = ["status"]
+  var args = ["status", "--signal-file=\(signalFilePath)"]
   if let duration = durationSeconds {
     args.append("--duration=\(duration)")
   }
@@ -220,15 +222,13 @@ func launchStatusUI(durationSeconds: Int?) throws -> StatusUIHandle {
   env["__CFBundleIdentifier"] = "com.argus.status"
   process.environment = env
 
-  let inputPipe = Pipe()
   let outputPipe = Pipe()
-  process.standardInput = inputPipe
   process.standardOutput = outputPipe
   process.standardError = FileHandle.standardError
 
   try process.run()
 
-  return StatusUIHandle(process: process, inputPipe: inputPipe, outputPipe: outputPipe)
+  return StatusUIHandle(process: process, outputPipe: outputPipe, signalFilePath: signalFilePath)
 }
 
 /// Legacy function for backward compatibility - launches status UI and waits for it to exit
@@ -292,9 +292,8 @@ enum RecordingOrchestrator {
 
           // Run a task to wait for the status UI to output its result (recording stopped)
           // and then stop the screen recording
-          // Capture handle and screenRecorder explicitly for Sendable compliance
+          // Capture outputPipe explicitly for Sendable compliance
           let outputPipe = handle.outputPipe
-          let inputPipe = handle.inputPipe
           Task { @Sendable in
             // Read the result when status UI outputs it (after recording phase completes)
             // This blocks until the status UI writes to stdout
@@ -302,13 +301,8 @@ enum RecordingOrchestrator {
             if let result = try? JSONDecoder().decode(StatusUIResult.self, from: data) {
               // Status UI transitioned to analyzing - stop recording
               switch result.result {
-              case .stopped, .timeout:
+              case .stopped, .timeout, .cancelled:
                 _ = try? await screenRecorder.stopRecording()
-              case .cancelled:
-                _ = try? await screenRecorder.stopRecording()
-                // For cancel, signal the UI to exit
-                inputPipe.fileHandleForWriting.write("success\n".data(using: .utf8)!)
-                try? inputPipe.fileHandleForWriting.close()
               }
             }
           }

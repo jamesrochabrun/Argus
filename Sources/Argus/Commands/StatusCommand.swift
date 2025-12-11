@@ -15,6 +15,9 @@ struct StatusCommand: ParsableCommand {
   @Option(name: .long, help: "Recording duration in seconds (omit for manual stop mode)")
   var duration: Int?
 
+  @Option(name: .long, help: "Path to signal file for completion notification")
+  var signalFile: String?
+
   func run() throws {
     // IMPORTANT: We must run AppKit on the main thread.
     // ArgumentParser may call run() on a background thread when using async main,
@@ -24,7 +27,7 @@ struct StatusCommand: ParsableCommand {
       let app = NSApplication.shared
       app.setActivationPolicy(.regular)
 
-      let delegate = StatusAppDelegate(durationSeconds: duration)
+      let delegate = StatusAppDelegate(durationSeconds: duration, signalFilePath: signalFile)
       app.delegate = delegate
       app.run()  // This blocks until NSApp.terminate() is called
     }
@@ -273,6 +276,22 @@ struct RecordingStatusView: View {
           }
           .buttonStyle(.plain)
         }
+
+        // Cancel button (during analyzing state)
+        if stateManager.state == .analyzing {
+          Button(action: {
+            stateManager.handleCancelClicked()
+          }) {
+            Text("Cancel")
+              .font(.system(size: 13, weight: .medium))
+              .foregroundStyle(.white)
+              .padding(.horizontal, 14)
+              .padding(.vertical, 6)
+              .background(Color.orange.opacity(0.8))
+              .clipShape(RoundedRectangle(cornerRadius: 8))
+          }
+          .buttonStyle(.plain)
+        }
       }
       .padding(.horizontal, 16)
       .padding(.vertical, 12)
@@ -346,10 +365,12 @@ class StatusAppDelegate: NSObject, NSApplicationDelegate {
   var window: NSWindow?
   let stateManager = RecordingStateManager()
   let durationSeconds: Int?
-  private var stdinSource: DispatchSourceRead?
+  let signalFilePath: String?
+  private var signalCheckTimer: Timer?
 
-  init(durationSeconds: Int?) {
+  init(durationSeconds: Int?, signalFilePath: String?) {
     self.durationSeconds = durationSeconds
+    self.signalFilePath = signalFilePath
     super.init()
   }
 
@@ -400,42 +421,60 @@ class StatusAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     stateManager.onCancelClicked = { [weak self] in
-      self?.exitImmediately(result: .cancelled)
+      guard let self = self else { return }
+      // If in analyzing state, just exit silently (analysis continues in background)
+      // If in recording state, output cancelled result
+      if self.stateManager.state == .analyzing {
+        Darwin.exit(0)
+      } else {
+        self.exitImmediately(result: .cancelled)
+      }
     }
 
-    // Start listening for stdin commands (for analysis completion signals)
-    setupStdinListener()
+    // Start watching for signal file (for analysis completion signals)
+    setupSignalFileWatcher()
 
     // Start recording immediately
     stateManager.startRecording(durationSeconds: durationSeconds)
   }
 
-  private func setupStdinListener() {
-    // Listen for commands from parent process on stdin
-    // Commands: "success\n" or "error\n"
-    let stdinFD = FileHandle.standardInput.fileDescriptor
-    stdinSource = DispatchSource.makeReadSource(fileDescriptor: stdinFD, queue: .main)
+  private func setupSignalFileWatcher() {
+    guard signalFilePath != nil else { return }
 
-    stdinSource?.setEventHandler { [weak self] in
-      guard let self = self else { return }
+    // Poll for signal file every 100ms using target/selector pattern for MainActor safety
+    signalCheckTimer = Timer.scheduledTimer(
+      timeInterval: 0.1,
+      target: self,
+      selector: #selector(checkSignalFile),
+      userInfo: nil,
+      repeats: true
+    )
 
-      let data = FileHandle.standardInput.availableData
-      guard !data.isEmpty, let command = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) else {
-        return
-      }
+    // Ensure timer fires during UI interactions
+    if let timer = signalCheckTimer {
+      RunLoop.main.add(timer, forMode: .common)
+    }
+  }
 
-      // Handle commands from parent process
-      switch command {
+  @objc private func checkSignalFile() {
+    guard let path = signalFilePath else { return }
+
+    // Check if signal file exists and read its content
+    if let content = try? String(contentsOfFile: path, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines) {
+      // Clean up signal file
+      try? FileManager.default.removeItem(atPath: path)
+      signalCheckTimer?.invalidate()
+      signalCheckTimer = nil
+
+      switch content {
       case "success":
-        self.showSuccessAndExit()
+        showSuccessAndExit()
       case "error":
-        self.showErrorAndExit()
+        showErrorAndExit()
       default:
         break
       }
     }
-
-    stdinSource?.resume()
   }
 
   private func positionWindowAtTopCenter() {
@@ -468,8 +507,8 @@ class StatusAppDelegate: NSObject, NSApplicationDelegate {
   private func showSuccessAndExit() {
     stateManager.setSuccess()
 
-    // Brief delay to show success state
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+    // Brief delay to show success state, then exit
+    Timer.scheduledTimer(withTimeInterval: 1.0, repeats: false) { _ in
       Darwin.exit(0)
     }
   }
@@ -478,8 +517,8 @@ class StatusAppDelegate: NSObject, NSApplicationDelegate {
   private func showErrorAndExit() {
     stateManager.setError()
 
-    // Brief delay to show error state
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+    // Brief delay to show error state, then exit
+    Timer.scheduledTimer(withTimeInterval: 1.0, repeats: false) { _ in
       Darwin.exit(1)
     }
   }

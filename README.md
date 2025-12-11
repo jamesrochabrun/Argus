@@ -21,7 +21,8 @@ Add to `~/.claude.json`:
   "mcpServers": {
     "argus": {
       "type": "stdio",
-      "command": "~/.local/bin/argus-mcp",
+      "command": "~/.local/bin/argus",
+      "args": ["mcp"],
       "env": {
         "OPENAI_API_KEY": "your-openai-api-key"
       }
@@ -51,16 +52,15 @@ cd Argus
 swift build -c release
 
 # Auto-configure Claude Code (optional)
-.build/release/argus-mcp --setup
+.build/release/argus mcp --setup
 ```
 
 The `--setup` flag automatically updates `~/.claude.json` with the correct paths.
 
 ### Manual Configuration
 
-If you prefer manual setup, binaries are at:
-- `.build/release/argus-mcp` - Main MCP server
-- `.build/release/argus-select` - Visual region selector
+If you prefer manual setup, the binary is at:
+- `.build/release/argus` - Single binary with subcommands (`mcp`, `status`, `select`)
 
 Add to `~/.claude.json`:
 
@@ -69,7 +69,8 @@ Add to `~/.claude.json`:
   "mcpServers": {
     "argus": {
       "type": "stdio",
-      "command": "/absolute/path/to/Argus/.build/release/argus-mcp",
+      "command": "/absolute/path/to/Argus/.build/release/argus",
+      "args": ["mcp"],
       "env": {
         "OPENAI_API_KEY": "your-openai-api-key"
       }
@@ -204,11 +205,11 @@ Record my screen for 3 seconds and analyze with mode high
 +-----------------------------+-----------------------------+
                               | MCP Protocol (stdio)
 +-----------------------------v-----------------------------+
-|                        argus-mcp                           |
+|                       argus mcp                            |
 +-------------+-------------+-------------+-----------------+
 |   Screen    |    Video    |    Video    |     Region      |
 |  Recorder   |  Extractor  |  Analyzer   |    Selector     |
-|(ScreenKit)  |(AVFoundation)|  (OpenAI)  | (argus-select)  |
+|(ScreenKit)  |(AVFoundation)|  (OpenAI)  |(argus select)   |
 +-------------+-------------+------+------+-----------------+
                                    |
                           +--------v--------+
