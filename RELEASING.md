@@ -36,6 +36,6 @@ curl -fsSL https://raw.githubusercontent.com/jamesrochabrun/Argus/main/install.s
 ## User Uninstall
 
 ```bash
-rm -f ~/.local/bin/argus-mcp ~/.local/bin/argus-select
+rm -f ~/.local/bin/argus
 # Also remove "argus" from mcpServers in ~/.claude.json
 ```
