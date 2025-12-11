@@ -1,4 +1,3 @@
-import ArgumentParser
 import AVFoundation
 import Foundation
 import MCP
@@ -135,212 +134,227 @@ enum AnalysisCancellationError: Error, LocalizedError {
 /// Result of a recording session
 struct RecordingResult {
   let url: URL
-  let statusUI: RecordingStatusUI?
+}
+
+/// Result from the argus status subcommand
+struct StatusUIResult: Codable {
+  enum ResultType: String, Codable {
+    case stopped    // User clicked stop button
+    case timeout    // Max duration reached
+    case cancelled  // User cancelled
+  }
+
+  let result: ResultType
+  let elapsed: Int
+}
+
+/// Handle to a running status UI process, allowing us to signal completion
+class StatusUIHandle {
+  let process: Process
+  let inputPipe: Pipe
+  let outputPipe: Pipe
+  private var resultData: Data?
+
+  init(process: Process, inputPipe: Pipe, outputPipe: Pipe) {
+    self.process = process
+    self.inputPipe = inputPipe
+    self.outputPipe = outputPipe
+  }
+
+  /// Read the status result from stdout (call after recording phase completes)
+  func readResult() throws -> StatusUIResult {
+    // Read available data from output pipe
+    let data = outputPipe.fileHandleForReading.availableData
+
+    guard let result = try? JSONDecoder().decode(StatusUIResult.self, from: data) else {
+      throw ToolError.invalidArgument("Failed to parse status UI result")
+    }
+
+    return result
+  }
+
+  /// Signal that analysis completed successfully
+  func signalSuccess() {
+    inputPipe.fileHandleForWriting.write("success\n".data(using: .utf8)!)
+    try? inputPipe.fileHandleForWriting.close()
+  }
+
+  /// Signal that analysis failed with an error
+  func signalError() {
+    inputPipe.fileHandleForWriting.write("error\n".data(using: .utf8)!)
+    try? inputPipe.fileHandleForWriting.close()
+  }
+
+  /// Wait for the status UI process to exit
+  func waitForExit() {
+    process.waitUntilExit()
+  }
+
+  /// Terminate the status UI immediately (for cleanup)
+  func terminate() {
+    if process.isRunning {
+      process.terminate()
+    }
+  }
+}
+
+/// Launch the status UI and return a handle for signaling completion
+/// The status UI will show "Recording" then transition to "Analyzing" when recording stops
+/// Call signalSuccess() or signalError() after analysis to complete the UI
+func launchStatusUI(durationSeconds: Int?) throws -> StatusUIHandle {
+  guard let executablePath = Bundle.main.executablePath else {
+    throw ToolError.invalidArgument("Cannot find own executable path")
+  }
+
+  let process = Process()
+  process.executableURL = URL(fileURLWithPath: executablePath)
+
+  var args = ["status"]
+  if let duration = durationSeconds {
+    args.append("--duration=\(duration)")
+  }
+  process.arguments = args
+
+  // Set environment to allow GUI access when launched from non-GUI parent
+  var env = ProcessInfo.processInfo.environment
+  env["__CFBundleIdentifier"] = "com.argus.status"
+  process.environment = env
+
+  let inputPipe = Pipe()
+  let outputPipe = Pipe()
+  process.standardInput = inputPipe
+  process.standardOutput = outputPipe
+  process.standardError = FileHandle.standardError
+
+  try process.run()
+
+  return StatusUIHandle(process: process, inputPipe: inputPipe, outputPipe: outputPipe)
+}
+
+/// Legacy function for backward compatibility - launches status UI and waits for it to exit
+/// Use launchStatusUI() + StatusUIHandle for the new analyzing state flow
+func launchStatusUIAndWait(durationSeconds: Int?) async throws -> StatusUIResult {
+  let handle = try launchStatusUI(durationSeconds: durationSeconds)
+
+  // Wait for recording to complete (status UI will output JSON then transition to analyzing)
+  // Since we're using the old flow, signal success immediately to exit
+  handle.signalSuccess()
+  handle.waitForExit()
+
+  // For legacy compatibility, return a default result
+  return StatusUIResult(result: .timeout, elapsed: durationSeconds ?? 0)
 }
 
 // MARK: - Recording Orchestrator
 
-/// Orchestrates screen recording with UI feedback and duration handling
+/// Result of recording phase, includes status UI handle for signaling analysis completion
+struct RecordingPhaseResult {
+  let url: URL
+  let statusUIHandle: StatusUIHandle?
+}
+
+/// Orchestrates screen recording with synchronous status UI
 enum RecordingOrchestrator {
 
-  /// Performs a recording session with optional duration
+  /// Performs a recording session with synchronous status UI
   /// - Parameters:
   ///   - eventStream: The recording event stream from ScreenRecorder
   ///   - durationSeconds: nil = manual mode (user clicks Stop), Int = timed mode
   ///   - maxDuration: Maximum allowed recording duration (mode-specific)
   ///   - screenRecorder: The screen recorder instance
-  /// - Returns: RecordingResult containing URL, status UI, and event stream for cancel monitoring
+  /// - Returns: RecordingPhaseResult containing URL and status UI handle for signaling analysis completion
   static func performRecording(
     eventStream: AsyncStream<ScreenRecorder.RecordingEvent>,
     durationSeconds: Int?,
     maxDuration: Int,
     screenRecorder: ScreenRecorder
-  ) async throws -> RecordingResult {
+  ) async throws -> RecordingPhaseResult {
     // Cap duration at max
     let effectiveDuration: Int? = durationSeconds.map { min($0, maxDuration) }
 
-    // Launch recording status UI
-    let logFile = URL(fileURLWithPath: "/tmp/argus-debug.log")
-    func debugLog(_ msg: String) {
-      let line = "[\(Date())] \(msg)\n"
-      FileHandle.standardError.write(line.data(using: .utf8)!)
-      if let handle = try? FileHandle(forWritingTo: logFile) {
-        handle.seekToEndOfFile()
-        handle.write(line.data(using: .utf8)!)
-        handle.closeFile()
-      } else {
-        FileManager.default.createFile(atPath: logFile.path, contents: line.data(using: .utf8))
-      }
-    }
-
-    debugLog("[Orchestrator] Creating status UI...")
-    let statusUI = await MainActor.run { RecordingStatusUI() }
-    debugLog("[Orchestrator] Status UI instance created")
-
-    // Try to launch UI (continue without it if it fails)
-    let uiEvents: AsyncStream<RecordingStatusUI.UIEvent>?
-    do {
-      debugLog("[Orchestrator] Launching status UI with duration: \(effectiveDuration.map { String($0) } ?? "nil")...")
-      uiEvents = try await statusUI.launch(config: .init(durationSeconds: effectiveDuration))
-      debugLog("[Orchestrator] Status UI launched successfully, uiEvents is non-nil")
-    } catch {
-      debugLog("[Orchestrator] ERROR: Could not launch recording status UI: \(error)")
-      uiEvents = nil
-    }
-    debugLog("[Orchestrator] Proceeding with recording, uiEvents is \(uiEvents == nil ? "nil" : "set")")
-
     var videoURL: URL?
+    var firstFrameReceived = false
+    var statusUIHandle: StatusUIHandle?
 
-    // Timeout for first frame capture (5 seconds)
-    // If ScreenCaptureKit doesn't produce frames, we don't want to hang forever
-    let firstFrameTimeoutSeconds = 5
+    // Wait for first frame before launching status UI
+    for await event in eventStream {
+      switch event {
+      case .started(let url):
+        videoURL = url
 
-    // Process recording events with timeout for first frame
-    // We use a task group to race between event processing and timeout
-    let recordingResult: (url: URL?, timedOut: Bool) = try await withThrowingTaskGroup(of: (url: URL?, timedOut: Bool).self) { group in
+      case .firstFrameCaptured:
+        firstFrameReceived = true
+        // First frame received - launch status UI
+        // The status UI will show "Recording" then auto-transition to "Analyzing" when recording stops
+        do {
+          let handle = try launchStatusUI(durationSeconds: effectiveDuration)
+          statusUIHandle = handle
 
-      // Main event processing task
-      group.addTask {
-        var url: URL?
-        var receivedFirstFrame = false
-
-        for await event in eventStream {
-          switch event {
-          case .started(let startedURL):
-            url = startedURL
-
-          case .firstFrameCaptured:
-            receivedFirstFrame = true
-            // Notify UI that recording has started (timer begins)
-            await statusUI.notifyRecordingStarted()
-
-            // Race between duration timer (if timed mode) and UI stop events
-            if let uiEvents = uiEvents {
-              await withTaskGroup(of: Void.self) { innerGroup in
-                // Timer task (only if duration specified - timed mode)
-                if let duration = effectiveDuration {
-                  innerGroup.addTask {
-                    try? await Task.sleep(for: .seconds(duration))
-                    _ = try? await screenRecorder.stopRecording()
-                  }
-                }
-
-                // UI events task (handles Stop button and timeout for manual mode)
-                innerGroup.addTask {
-                  for await uiEvent in uiEvents {
-                    switch uiEvent {
-                    case .stopClicked, .timeout:
-                      // User explicitly stopped or max duration reached
-                      _ = try? await screenRecorder.stopRecording()
-                      return
-                    case .processExited:
-                      // UI process terminated - only stop if in manual mode
-                      if effectiveDuration == nil {
-                        _ = try? await screenRecorder.stopRecording()
-                        return
-                      }
-                      // In timed mode, ignore and let timer handle it
-                      break
-                    case .ready, .cancelClicked:
-                      break
-                    }
-                  }
-                  // Stream finished without explicit stop - wait indefinitely
-                  // (timer task will handle stopping if in timed mode)
-                  if effectiveDuration != nil {
-                    // In timed mode, just wait - timer will stop recording
-                    try? await Task.sleep(for: .seconds(86400))
-                  } else {
-                    // In manual mode with no UI, stop recording
-                    _ = try? await screenRecorder.stopRecording()
-                  }
-                }
-
-                await innerGroup.next()
-                innerGroup.cancelAll()
-              }
-            } else {
-              // No UI available
-              if let duration = effectiveDuration {
-                try? await Task.sleep(for: .seconds(duration))
+          // Run a task to wait for the status UI to output its result (recording stopped)
+          // and then stop the screen recording
+          // Capture handle and screenRecorder explicitly for Sendable compliance
+          let outputPipe = handle.outputPipe
+          let inputPipe = handle.inputPipe
+          Task { @Sendable in
+            // Read the result when status UI outputs it (after recording phase completes)
+            // This blocks until the status UI writes to stdout
+            let data = outputPipe.fileHandleForReading.availableData
+            if let result = try? JSONDecoder().decode(StatusUIResult.self, from: data) {
+              // Status UI transitioned to analyzing - stop recording
+              switch result.result {
+              case .stopped, .timeout:
                 _ = try? await screenRecorder.stopRecording()
-              } else {
-                try? await Task.sleep(for: .seconds(maxDuration))
+              case .cancelled:
                 _ = try? await screenRecorder.stopRecording()
+                // For cancel, signal the UI to exit
+                inputPipe.fileHandleForWriting.write("success\n".data(using: .utf8)!)
+                try? inputPipe.fileHandleForWriting.close()
               }
             }
-
-          case .stopped(let stoppedURL):
-            url = stoppedURL
-            await statusUI.notifyAnalyzing()
-            return (url: url, timedOut: false)
-
-          case .error(let message):
-            await statusUI.notifyError()
-            try? await Task.sleep(for: .seconds(1.5))
-            await MainActor.run { statusUI.terminate() }
-            throw ToolError.invalidArgument(message)
+          }
+        } catch {
+          // Status UI failed - fall back to timer-based recording
+          FileHandle.standardError.write("Status UI failed: \(error). Using fallback timer.\n".data(using: .utf8)!)
+          Task {
+            if let duration = effectiveDuration {
+              try? await Task.sleep(for: .seconds(duration))
+            } else {
+              try? await Task.sleep(for: .seconds(maxDuration))
+            }
+            _ = try? await screenRecorder.stopRecording()
           }
         }
 
-        // If we get here without receiving first frame, something went wrong
-        if !receivedFirstFrame {
-          return (url: nil, timedOut: true)
+      case .stopped(let url):
+        videoURL = url
+        guard let finalURL = videoURL else {
+          throw ToolError.invalidArgument("Recording failed - no output URL")
         }
+        return RecordingPhaseResult(url: finalURL, statusUIHandle: statusUIHandle)
 
-        return (url: url, timedOut: false)
+      case .error(let message):
+        // Signal error to status UI if running
+        statusUIHandle?.signalError()
+        throw ToolError.invalidArgument(message)
       }
-
-      // Timeout task - only triggers if first frame doesn't arrive
-      group.addTask {
-        try await Task.sleep(for: .seconds(firstFrameTimeoutSeconds))
-        return (url: nil, timedOut: true)
-      }
-
-      // Wait for first task to complete
-      if let result = try await group.next() {
-        group.cancelAll()
-        return result
-      }
-
-      return (url: nil, timedOut: true)
     }
 
-    // Handle timeout case
-    if recordingResult.timedOut {
-      FileHandle.standardError.write("Error: Timed out waiting for first frame from ScreenCaptureKit\n".data(using: .utf8)!)
-      await statusUI.notifyError()
-      try? await Task.sleep(for: .seconds(1.5))
-      await MainActor.run { statusUI.terminate() }
-      // Try to stop the recording to clean up
-      _ = try? await screenRecorder.stopRecording()
+    // If we got here without receiving first frame, something went wrong
+    if !firstFrameReceived {
+      statusUIHandle?.signalError()
       throw ToolError.invalidArgument("Recording failed - screen capture did not start. Please try again.")
     }
 
-    videoURL = recordingResult.url
-
     guard let finalURL = videoURL else {
-      await statusUI.notifyError()
-      try? await Task.sleep(for: .seconds(1.5))
-      await MainActor.run { statusUI.terminate() }
+      statusUIHandle?.signalError()
       throw ToolError.invalidArgument("Recording failed - no output URL")
     }
 
-    return RecordingResult(url: finalURL, statusUI: statusUI)
+    return RecordingPhaseResult(url: finalURL, statusUIHandle: statusUIHandle)
   }
 
-  /// Performs analysis with cancellation support
-  /// - Parameters:
-  ///   - videoURL: URL of the recorded video
-  ///   - mode: Analysis mode
-  ///   - context: Context description for the prompt
-  ///   - customPrompt: Optional custom prompt
-  ///   - effectiveDuration: Recording duration
-  ///   - frameExtractor: Frame extractor instance
-  ///   - videoAnalyzer: Video analyzer instance
-  ///   - statusUI: Status UI for showing success/error and getting fresh event stream
-  /// - Returns: Analysis result or throws if cancelled/failed
-  static func performAnalysisWithCancellation(
+  /// Performs video analysis and signals the status UI when done
+  static func performAnalysis(
     videoURL: URL,
     mode: AnalysisMode,
     context: String,
@@ -348,15 +362,10 @@ enum RecordingOrchestrator {
     effectiveDuration: Int,
     frameExtractor: VideoFrameExtractor,
     videoAnalyzer: VideoAnalyzer,
-    statusUI: RecordingStatusUI?
+    statusUIHandle: StatusUIHandle?
   ) async throws -> (extraction: VideoFrameExtractor.ExtractionResult, analysis: VideoAnalyzer.VideoAnalysisResult) {
-    // Get a fresh event stream from the status UI for analysis phase
-    // This is needed because the recording phase consumes/exhausts the original stream
-    let uiEventStream = await statusUI?.getAnalysisEventStream()
-
-    // If no UI event stream, just run analysis directly
-    guard let uiEventStream = uiEventStream else {
-      return try await analyzeVideo(
+    do {
+      let result = try await analyzeVideo(
         url: videoURL,
         mode: mode,
         context: context,
@@ -365,73 +374,33 @@ enum RecordingOrchestrator {
         frameExtractor: frameExtractor,
         videoAnalyzer: videoAnalyzer
       )
+
+      // Signal success to status UI
+      statusUIHandle?.signalSuccess()
+
+      return result
+    } catch {
+      // Signal error to status UI
+      statusUIHandle?.signalError()
+      throw error
     }
-
-    // Run analysis with cancellation monitoring
-    return try await withThrowingTaskGroup(of: (VideoFrameExtractor.ExtractionResult, VideoAnalyzer.VideoAnalysisResult)?.self) { group in
-      // Analysis task
-      group.addTask {
-        try await analyzeVideo(
-          url: videoURL,
-          mode: mode,
-          context: context,
-          customPrompt: customPrompt,
-          effectiveDuration: effectiveDuration,
-          frameExtractor: frameExtractor,
-          videoAnalyzer: videoAnalyzer
-        )
-      }
-
-      // Cancel monitor task
-      group.addTask {
-        for await event in uiEventStream {
-          if case .cancelClicked = event {
-            throw AnalysisCancellationError.cancelledByUser
-          }
-        }
-        return nil // Stream ended without cancel
-      }
-
-      // Wait for first result
-      while let result = try await group.next() {
-        if let analysisResult = result {
-          group.cancelAll()
-          return analysisResult
-        }
-      }
-
-      // Should not reach here
-      throw ToolError.invalidArgument("Analysis failed unexpectedly")
-    }
-  }
-
-  /// Completes analysis and shows success/error in UI, then terminates
-  static func finalizeWithUI(
-    success: Bool,
-    statusUI: RecordingStatusUI
-  ) async {
-    if success {
-      await statusUI.notifySuccess()
-    } else {
-      await statusUI.notifyError()
-    }
-    try? await Task.sleep(for: .seconds(1.5))
-    await MainActor.run { statusUI.terminate() }
   }
 }
 
 // MARK: - Session Cleanup
 
-/// Kills orphan argus-status and argus-select processes to ensure fresh recording state.
+/// Kills orphan argus processes running status/select subcommands to ensure fresh recording state.
 /// This is called at the start of each tool handler to prevent state corruption from
 /// incomplete previous operations.
 func cleanupOrphanProcesses() {
-  let processNames = ["argus-status", "argus-select"]
+  // With single binary architecture, we kill argus processes running status/select subcommands
+  // Use pkill with -f to match command line arguments
+  let patterns = ["argus status", "argus select"]
 
-  for processName in processNames {
+  for pattern in patterns {
     let killProcess = Process()
     killProcess.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-    killProcess.arguments = ["-9", processName]  // SIGKILL for immediate termination
+    killProcess.arguments = ["-9", "-f", pattern]  // SIGKILL with full command line match
 
     // Redirect stderr to null to suppress "no matching processes" errors
     killProcess.standardError = FileHandle.nullDevice
@@ -482,179 +451,165 @@ func analyzeVideo(
   return (extraction: extractionResult, analysis: analysisResult)
 }
 
-@main
-struct ArgusMCPServer: AsyncParsableCommand {
-  static let configuration = CommandConfiguration(
-    commandName: "argus-mcp",
-    abstract: "MCP server for video analysis using OpenAI Vision API",
-    version: "1.0.0"
+// MARK: - MCP Server Entry Point
+
+/// Main entry point for the MCP server
+/// Called by MCPCommand subcommand
+public func runMCPServer() async throws {
+  // Get API key from environment
+  guard let apiKey = ProcessInfo.processInfo.environment["OPENAI_API_KEY"] else {
+    FileHandle.standardError.write("Error: OPENAI_API_KEY environment variable not set\n".data(using: .utf8)!)
+    throw ToolError.invalidArgument("OPENAI_API_KEY environment variable not set")
+  }
+
+  let frameExtractor = VideoFrameExtractor()
+  let videoAnalyzer = VideoAnalyzer(apiKey: apiKey)
+  let screenRecorder = ScreenRecorder()
+
+  // Define tools with Value-based input schemas
+  let tools: [MCPTool] = [
+    MCPTool(
+      name: "analyze_video",
+      description: """
+        Analyze a video file for detailed visual descriptions of UI content, animations, and design elements.
+        Use to document recorded interactions, describe animation sequences, or get frame-by-frame visual analysis.
+        Supports MP4, MOV, and other common formats.
+        """,
+      inputSchema: .object([
+        "type": "object",
+        "properties": .object([
+          "video_path": .object([
+            "type": "string",
+            "description": "Absolute path to the video file to analyze"
+          ]),
+          "frames_per_second": .object([
+            "type": "number",
+            "description": "Number of frames to extract per second (default varies by mode)"
+          ]),
+          "max_frames": .object([
+            "type": "integer",
+            "description": "Maximum number of frames to extract (default varies by mode)"
+          ]),
+          "mode": .object([
+            "type": "string",
+            "description": """
+              Analysis mode:
+              - 'low': Quick Analysis (~$0.003) - Efficient visual description. 4fps, max 30s.
+              - 'high': Detailed Analysis (~$0.01) - Thorough visual description. 8fps, max 30s (150 frame cap).
+              """,
+            "enum": .array(["low", "high"])
+          ]),
+          "custom_prompt": .object([
+            "type": "string",
+            "description": "Optional custom system prompt for analysis"
+          ])
+        ]),
+        "required": .array(["video_path"])
+      ])
+    ),
+
+    MCPTool(
+      name: "record_and_analyze",
+      description: """
+        Record screen and get detailed visual descriptions of the content.
+        Perfect for documenting UI interactions, describing animations, or capturing visual details
+        of your application. Recording includes a visual status indicator.
+        """,
+      inputSchema: .object([
+        "type": "object",
+        "properties": .object([
+          "duration_seconds": .object([
+            "type": "integer",
+            "description": "Duration to record in seconds. If not provided, recording runs until user clicks Stop (max 30s for all modes)."
+          ]),
+          "mode": .object([
+            "type": "string",
+            "description": """
+              Analysis mode:
+              - 'low': Quick Analysis (~$0.003) - Efficient visual description. 4fps, max 30s.
+              - 'high': Detailed Analysis (~$0.01) - Thorough visual description. 8fps, max 30s (150 frame cap).
+              """,
+            "enum": .array(["low", "high"])
+          ]),
+          "custom_prompt": .object([
+            "type": "string",
+            "description": "Optional custom system prompt for analysis"
+          ])
+        ]),
+        "required": .array(["mode"])
+      ])
+    ),
+
+    MCPTool(
+      name: "select_record_and_analyze",
+      description: """
+        Select a screen region with visual crosshair, record it, and get detailed descriptions.
+        Ideal for documenting specific UI components - buttons, modals, form fields,
+        or individual animations without recording the entire screen.
+        """,
+      inputSchema: .object([
+        "type": "object",
+        "properties": .object([
+          "duration_seconds": .object([
+            "type": "integer",
+            "description": "Duration to record in seconds. If not provided, recording runs until user clicks Stop (max 30s for all modes)."
+          ]),
+          "mode": .object([
+            "type": "string",
+            "description": """
+              Analysis mode:
+              - 'low': Quick Analysis (~$0.003) - Efficient visual description. 4fps, max 30s.
+              - 'high': Detailed Analysis (~$0.01) - Thorough visual description. 8fps, max 30s (150 frame cap).
+              """,
+            "enum": .array(["low", "high"])
+          ]),
+          "custom_prompt": .object([
+            "type": "string",
+            "description": "Optional custom analysis prompt"
+          ])
+        ]),
+        "required": .array(["mode"])
+      ])
+    )
+  ]
+
+  // Create server with tool capabilities
+  let server = Server(
+    name: "argus",
+    version: "1.1.0",
+    capabilities: Server.Capabilities(tools: .init())
   )
 
-  @Flag(name: .long, help: "Configure Claude Code to use Argus MCP server")
-  var setup = false
-
-  mutating func run() async throws {
-    // Handle --setup flag
-    if setup {
-      try runSetup()
-      return
-    }
-
-    // Get API key from environment
-    guard let apiKey = ProcessInfo.processInfo.environment["OPENAI_API_KEY"] else {
-      FileHandle.standardError.write("Error: OPENAI_API_KEY environment variable not set\n".data(using: .utf8)!)
-      throw ExitCode.failure
-    }
-
-    let frameExtractor = VideoFrameExtractor()
-    let videoAnalyzer = VideoAnalyzer(apiKey: apiKey)
-    let screenRecorder = ScreenRecorder()
-
-    // Define tools with Value-based input schemas
-    let tools: [MCPTool] = [
-      MCPTool(
-        name: "analyze_video",
-        description: """
-          Analyze a video file for detailed visual descriptions of UI content, animations, and design elements.
-          Use to document recorded interactions, describe animation sequences, or get frame-by-frame visual analysis.
-          Supports MP4, MOV, and other common formats.
-          """,
-        inputSchema: .object([
-          "type": "object",
-          "properties": .object([
-            "video_path": .object([
-              "type": "string",
-              "description": "Absolute path to the video file to analyze"
-            ]),
-            "frames_per_second": .object([
-              "type": "number",
-              "description": "Number of frames to extract per second (default varies by mode)"
-            ]),
-            "max_frames": .object([
-              "type": "integer",
-              "description": "Maximum number of frames to extract (default varies by mode)"
-            ]),
-            "mode": .object([
-              "type": "string",
-              "description": """
-                Analysis mode:
-                - 'low': Quick Analysis (~$0.003) - Efficient visual description. 4fps, max 30s.
-                - 'high': Detailed Analysis (~$0.01) - Thorough visual description. 8fps, max 30s (150 frame cap).
-                """,
-              "enum": .array(["low", "high"])
-            ]),
-            "custom_prompt": .object([
-              "type": "string",
-              "description": "Optional custom system prompt for analysis"
-            ])
-          ]),
-          "required": .array(["video_path"])
-        ])
-      ),
-
-      MCPTool(
-        name: "record_and_analyze",
-        description: """
-          Record screen and get detailed visual descriptions of the content.
-          Perfect for documenting UI interactions, describing animations, or capturing visual details
-          of your application. Recording includes a visual status indicator.
-          """,
-        inputSchema: .object([
-          "type": "object",
-          "properties": .object([
-            "duration_seconds": .object([
-              "type": "integer",
-              "description": "Duration to record in seconds. If not provided, recording runs until user clicks Stop (max 30s for all modes)."
-            ]),
-            "mode": .object([
-              "type": "string",
-              "description": """
-                Analysis mode:
-                - 'low': Quick Analysis (~$0.003) - Efficient visual description. 4fps, max 30s.
-                - 'high': Detailed Analysis (~$0.01) - Thorough visual description. 8fps, max 30s (150 frame cap).
-                """,
-              "enum": .array(["low", "high"])
-            ]),
-            "custom_prompt": .object([
-              "type": "string",
-              "description": "Optional custom system prompt for analysis"
-            ])
-          ]),
-          "required": .array(["mode"])
-        ])
-      ),
-
-      MCPTool(
-        name: "select_record_and_analyze",
-        description: """
-          Select a screen region with visual crosshair, record it, and get detailed descriptions.
-          Ideal for documenting specific UI components - buttons, modals, form fields,
-          or individual animations without recording the entire screen.
-          """,
-        inputSchema: .object([
-          "type": "object",
-          "properties": .object([
-            "duration_seconds": .object([
-              "type": "integer",
-              "description": "Duration to record in seconds. If not provided, recording runs until user clicks Stop (max 30s for all modes)."
-            ]),
-            "mode": .object([
-              "type": "string",
-              "description": """
-                Analysis mode:
-                - 'low': Quick Analysis (~$0.003) - Efficient visual description. 4fps, max 30s.
-                - 'high': Detailed Analysis (~$0.01) - Thorough visual description. 8fps, max 30s (150 frame cap).
-                """,
-              "enum": .array(["low", "high"])
-            ]),
-            "custom_prompt": .object([
-              "type": "string",
-              "description": "Optional custom analysis prompt"
-            ])
-          ]),
-          "required": .array(["mode"])
-        ])
-      )
-    ]
-
-    // Create server with tool capabilities
-    let server = Server(
-      name: "argus-mcp",
-      version: "1.0.0",
-      capabilities: Server.Capabilities(tools: .init())
-    )
-
-    // Register tool list handler
-    await server.withMethodHandler(ListTools.self) { _ in
-      ListTools.Result(tools: tools)
-    }
-
-    // Register tool call handler
-    await server.withMethodHandler(CallTool.self) { params in
-      do {
-        let result = try await handleToolCall(
-          name: params.name,
-          arguments: params.arguments ?? [:],
-          frameExtractor: frameExtractor,
-          videoAnalyzer: videoAnalyzer,
-          screenRecorder: screenRecorder
-        )
-        return CallTool.Result(content: [.text(result)])
-      } catch {
-        return CallTool.Result(
-          content: [.text("Error: \(error.localizedDescription)")],
-          isError: true
-        )
-      }
-    }
-
-    // Start server with stdio transport
-    let transport = StdioTransport()
-    try await server.start(transport: transport)
-
-    // Keep server running
-    await server.waitUntilCompleted()
+  // Register tool list handler
+  await server.withMethodHandler(ListTools.self) { _ in
+    ListTools.Result(tools: tools)
   }
+
+  // Register tool call handler
+  await server.withMethodHandler(CallTool.self) { params in
+    do {
+      let result = try await handleToolCall(
+        name: params.name,
+        arguments: params.arguments ?? [:],
+        frameExtractor: frameExtractor,
+        videoAnalyzer: videoAnalyzer,
+        screenRecorder: screenRecorder
+      )
+      return CallTool.Result(content: [.text(result)])
+    } catch {
+      return CallTool.Result(
+        content: [.text("Error: \(error.localizedDescription)")],
+        isError: true
+      )
+    }
+  }
+
+  // Start server with stdio transport
+  let transport = StdioTransport()
+  try await server.start(transport: transport)
+
+  // Keep server running
+  await server.waitUntilCompleted()
 }
 
 // MARK: - Tool Call Handler
@@ -792,88 +747,45 @@ func handleRecordAndAnalyze(
   videoAnalyzer: VideoAnalyzer,
   screenRecorder: ScreenRecorder
 ) async throws -> String {
-  // Debug logging helper
-  func debugLog(_ msg: String) {
-    let line = "[\(Date())] \(msg)\n"
-    if let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: "/tmp/argus-debug.log")) {
-      handle.seekToEndOfFile()
-      handle.write(line.data(using: .utf8)!)
-      handle.closeFile()
-    } else {
-      FileManager.default.createFile(atPath: "/tmp/argus-debug.log", contents: line.data(using: .utf8))
-    }
-  }
-
-  debugLog("[handleRecordAndAnalyze] ENTERED")
-
   // Ensure clean state before starting new recording
   cleanupOrphanProcesses()
-  debugLog("[handleRecordAndAnalyze] cleanupOrphanProcesses done")
-
   await screenRecorder.forceReset()
-  debugLog("[handleRecordAndAnalyze] forceReset done")
 
   // Duration is optional: nil = manual mode, Int = timed mode (capped based on mode)
   let durationSeconds = arguments["duration_seconds"]?.intValue
   let mode = AnalysisMode(rawValue: arguments["mode"]?.stringValue ?? "low") ?? .low
   let effectiveDuration = durationSeconds.map { min($0, mode.maxDuration) } ?? mode.maxDuration
-  debugLog("[handleRecordAndAnalyze] Starting recording...")
 
   // Start recording
   let eventStream = try await screenRecorder.startRecordingWithEvents()
-  debugLog("[handleRecordAndAnalyze] Got eventStream, calling performRecording...")
-  let recordingResult = try await RecordingOrchestrator.performRecording(
+  let recordingPhase = try await RecordingOrchestrator.performRecording(
     eventStream: eventStream,
     durationSeconds: durationSeconds,
     maxDuration: mode.maxDuration,
     screenRecorder: screenRecorder
   )
 
-  // Analyze video with cancellation support
-  do {
-    let result = try await RecordingOrchestrator.performAnalysisWithCancellation(
-      videoURL: recordingResult.url,
-      mode: mode,
-      context: "screen recording",
-      customPrompt: arguments["custom_prompt"]?.stringValue,
-      effectiveDuration: effectiveDuration,
-      frameExtractor: frameExtractor,
-      videoAnalyzer: videoAnalyzer,
-      statusUI: recordingResult.statusUI
-    )
+  // Analyze video (status UI will show "Analyzing..." during this phase)
+  let result = try await RecordingOrchestrator.performAnalysis(
+    videoURL: recordingPhase.url,
+    mode: mode,
+    context: "screen recording",
+    customPrompt: arguments["custom_prompt"]?.stringValue,
+    effectiveDuration: effectiveDuration,
+    frameExtractor: frameExtractor,
+    videoAnalyzer: videoAnalyzer,
+    statusUIHandle: recordingPhase.statusUIHandle
+  )
 
-    // Finalize UI with success
-    if let statusUI = recordingResult.statusUI {
-      await RecordingOrchestrator.finalizeWithUI(success: true, statusUI: statusUI)
-    }
+  let durationText = durationSeconds.map { "\($0) seconds" } ?? "manual (user stopped)"
 
-    let durationText = durationSeconds.map { "\($0) seconds" } ?? "manual (user stopped)"
+  return """
+    Recording completed and analyzed.
+    Video file: \(recordingPhase.url.path)
+    Duration: \(durationText)
 
-    return """
-      Recording completed and analyzed.
-      Video file: \(recordingResult.url.path)
-      Duration: \(durationText)
-
-      \(formatAnalysisResult(extraction: result.extraction, analysis: result.analysis))
-      """
-  } catch let error as AnalysisCancellationError {
-    // User cancelled - show cancelled state in UI briefly, then dismiss
-    // Do this in background so we can return to Claude Code immediately
-    if let statusUI = recordingResult.statusUI {
-      Task {
-        await statusUI.notifyCancelled()
-        try? await Task.sleep(for: .seconds(1))
-        await MainActor.run { statusUI.terminate() }
-      }
-    }
-    return error.localizedDescription
-  } catch {
-    // Analysis failed - show error in UI
-    if let statusUI = recordingResult.statusUI {
-      await RecordingOrchestrator.finalizeWithUI(success: false, statusUI: statusUI)
-    }
-    throw ToolError.invalidArgument("Video analysis failed: \(error.localizedDescription)")
-  }
+    \(formatAnalysisResult(extraction: result.extraction, analysis: result.analysis))
+    """
 }
 
 // MARK: - App Recording Handlers
@@ -909,59 +821,35 @@ func handleRecordSimulatorAndAnalyze(
     config: recordingConfig,
     outputPath: nil
   )
-  let recordingResult = try await RecordingOrchestrator.performRecording(
+  let recordingPhase = try await RecordingOrchestrator.performRecording(
     eventStream: eventStream,
     durationSeconds: durationSeconds,
     maxDuration: mode.maxDuration,
     screenRecorder: screenRecorder
   )
 
-  // Analyze video with cancellation support
-  do {
-    let result = try await RecordingOrchestrator.performAnalysisWithCancellation(
-      videoURL: recordingResult.url,
-      mode: mode,
-      context: "iOS Simulator recording",
-      customPrompt: arguments["custom_prompt"]?.stringValue,
-      effectiveDuration: effectiveDuration,
-      frameExtractor: frameExtractor,
-      videoAnalyzer: videoAnalyzer,
-      statusUI: recordingResult.statusUI
-    )
+  // Analyze video (status UI will show "Analyzing..." during this phase)
+  let result = try await RecordingOrchestrator.performAnalysis(
+    videoURL: recordingPhase.url,
+    mode: mode,
+    context: "iOS Simulator recording",
+    customPrompt: arguments["custom_prompt"]?.stringValue,
+    effectiveDuration: effectiveDuration,
+    frameExtractor: frameExtractor,
+    videoAnalyzer: videoAnalyzer,
+    statusUIHandle: recordingPhase.statusUIHandle
+  )
 
-    // Finalize UI with success
-    if let statusUI = recordingResult.statusUI {
-      await RecordingOrchestrator.finalizeWithUI(success: true, statusUI: statusUI)
-    }
+  let durationText = durationSeconds.map { "\($0) seconds" } ?? "manual (user stopped)"
 
-    let durationText = durationSeconds.map { "\($0) seconds" } ?? "manual (user stopped)"
+  return """
+    iOS Simulator recording completed and analyzed.
+    Video file: \(recordingPhase.url.path)
+    Duration: \(durationText)
+    Analysis mode: \(mode.rawValue)
 
-    return """
-      iOS Simulator recording completed and analyzed.
-      Video file: \(recordingResult.url.path)
-      Duration: \(durationText)
-      Analysis mode: \(mode.rawValue)
-
-      \(formatAnalysisResult(extraction: result.extraction, analysis: result.analysis))
-      """
-  } catch let error as AnalysisCancellationError {
-    // User cancelled - show cancelled state in UI briefly, then dismiss
-    // Do this in background so we can return to Claude Code immediately
-    if let statusUI = recordingResult.statusUI {
-      Task {
-        await statusUI.notifyCancelled()
-        try? await Task.sleep(for: .seconds(1))
-        await MainActor.run { statusUI.terminate() }
-      }
-    }
-    return error.localizedDescription
-  } catch {
-    // Analysis failed - show error in UI
-    if let statusUI = recordingResult.statusUI {
-      await RecordingOrchestrator.finalizeWithUI(success: false, statusUI: statusUI)
-    }
-    throw ToolError.invalidArgument("Video analysis failed: \(error.localizedDescription)")
-  }
+    \(formatAnalysisResult(extraction: result.extraction, analysis: result.analysis))
+    """
 }
 
 func handleRecordAppAndAnalyze(
@@ -999,64 +887,40 @@ func handleRecordAppAndAnalyze(
     config: recordingConfig,
     outputPath: nil
   )
-  let recordingResult = try await RecordingOrchestrator.performRecording(
+  let recordingPhase = try await RecordingOrchestrator.performRecording(
     eventStream: eventStream,
     durationSeconds: durationSeconds,
     maxDuration: mode.maxDuration,
     screenRecorder: screenRecorder
   )
 
-  // Analyze video with cancellation support
-  do {
-    let result = try await RecordingOrchestrator.performAnalysisWithCancellation(
-      videoURL: recordingResult.url,
-      mode: mode,
-      context: "'\(appName)' recording",
-      customPrompt: arguments["custom_prompt"]?.stringValue,
-      effectiveDuration: effectiveDuration,
-      frameExtractor: frameExtractor,
-      videoAnalyzer: videoAnalyzer,
-      statusUI: recordingResult.statusUI
-    )
+  // Analyze video (status UI will show "Analyzing..." during this phase)
+  let result = try await RecordingOrchestrator.performAnalysis(
+    videoURL: recordingPhase.url,
+    mode: mode,
+    context: "'\(appName)' recording",
+    customPrompt: arguments["custom_prompt"]?.stringValue,
+    effectiveDuration: effectiveDuration,
+    frameExtractor: frameExtractor,
+    videoAnalyzer: videoAnalyzer,
+    statusUIHandle: recordingPhase.statusUIHandle
+  )
 
-    // Finalize UI with success
-    if let statusUI = recordingResult.statusUI {
-      await RecordingOrchestrator.finalizeWithUI(success: true, statusUI: statusUI)
-    }
+  let durationText = durationSeconds.map { "\($0) seconds" } ?? "manual (user stopped)"
 
-    let durationText = durationSeconds.map { "\($0) seconds" } ?? "manual (user stopped)"
+  return """
+    '\(appName)' recording completed and analyzed.
+    Video file: \(recordingPhase.url.path)
+    Duration: \(durationText)
+    Analysis mode: \(mode.rawValue)
 
-    return """
-      '\(appName)' recording completed and analyzed.
-      Video file: \(recordingResult.url.path)
-      Duration: \(durationText)
-      Analysis mode: \(mode.rawValue)
-
-      \(formatAnalysisResult(extraction: result.extraction, analysis: result.analysis))
-      """
-  } catch let error as AnalysisCancellationError {
-    // User cancelled - show cancelled state in UI briefly, then dismiss
-    // Do this in background so we can return to Claude Code immediately
-    if let statusUI = recordingResult.statusUI {
-      Task {
-        await statusUI.notifyCancelled()
-        try? await Task.sleep(for: .seconds(1))
-        await MainActor.run { statusUI.terminate() }
-      }
-    }
-    return error.localizedDescription
-  } catch {
-    // Analysis failed - show error in UI
-    if let statusUI = recordingResult.statusUI {
-      await RecordingOrchestrator.finalizeWithUI(success: false, statusUI: statusUI)
-    }
-    throw ToolError.invalidArgument("Video analysis failed: \(error.localizedDescription)")
-  }
+    \(formatAnalysisResult(extraction: result.extraction, analysis: result.analysis))
+    """
 }
 
 // MARK: - Region Selection Handlers
 
-/// Result from the argus-select helper tool
+/// Result from the argus select subcommand
 struct SelectionResult: Codable {
   let x: Int
   let y: Int
@@ -1067,42 +931,17 @@ struct SelectionResult: Codable {
   let cancelled: Bool
 }
 
-/// Get the path to the argus-select binary
-func getArgusSelectPath() -> String {
-  // First check if we're in a development environment
-  let executableURL = Bundle.main.executableURL
-  if let bundlePath = executableURL?.deletingLastPathComponent().path {
-    let devPath = bundlePath + "/argus-select"
-    if FileManager.default.fileExists(atPath: devPath) {
-      return devPath
-    }
-  }
-
-  // Check common installation paths
-  let possiblePaths = [
-    "/usr/local/bin/argus-select",
-    "/opt/homebrew/bin/argus-select",
-    ProcessInfo.processInfo.environment["HOME"].map { $0 + "/.local/bin/argus-select" },
-    // Same directory as argus-mcp
-    executableURL?.deletingLastPathComponent().appendingPathComponent("argus-select").path
-  ].compactMap { $0 }
-
-  for path in possiblePaths {
-    if FileManager.default.fileExists(atPath: path) {
-      return path
-    }
-  }
-
-  // Default to assuming it's in PATH
-  return "argus-select"
-}
-
 /// Launch the visual region selector and return the selection
+/// Uses self-invocation: runs the same binary with "select" subcommand
 func launchRegionSelector() async throws -> SelectionResult {
-  let selectPath = getArgusSelectPath()
+  // Self-invocation: use the same binary with "select" subcommand
+  guard let executablePath = Bundle.main.executablePath else {
+    throw ToolError.invalidArgument("Cannot find own executable path")
+  }
 
   let process = Process()
-  process.executableURL = URL(fileURLWithPath: selectPath)
+  process.executableURL = URL(fileURLWithPath: executablePath)
+  process.arguments = ["select"]  // Run as subcommand
 
   let outputPipe = Pipe()
   let errorPipe = Pipe()
@@ -1133,37 +972,17 @@ func handleSelectRecordAndAnalyze(
   videoAnalyzer: VideoAnalyzer,
   screenRecorder: ScreenRecorder
 ) async throws -> String {
-  // Debug logging helper
-  func debugLog(_ msg: String) {
-    let line = "[\(Date())] \(msg)\n"
-    if let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: "/tmp/argus-debug.log")) {
-      handle.seekToEndOfFile()
-      handle.write(line.data(using: .utf8)!)
-      handle.closeFile()
-    } else {
-      FileManager.default.createFile(atPath: "/tmp/argus-debug.log", contents: line.data(using: .utf8))
-    }
-  }
-
-  debugLog("[handleSelectRecordAndAnalyze] ENTERED")
-
   // Ensure clean state before starting new recording
   cleanupOrphanProcesses()
-  debugLog("[handleSelectRecordAndAnalyze] cleanupOrphanProcesses done")
-
   await screenRecorder.forceReset()
-  debugLog("[handleSelectRecordAndAnalyze] forceReset done")
 
   // Duration is optional: nil = manual mode, Int = timed mode (capped based on mode)
   let durationSeconds = arguments["duration_seconds"]?.intValue
   let mode = AnalysisMode(rawValue: arguments["mode"]?.stringValue ?? "low") ?? .low
   let effectiveDuration = durationSeconds.map { min($0, mode.maxDuration) } ?? mode.maxDuration
 
-  debugLog("[handleSelectRecordAndAnalyze] Launching region selector...")
-
   // First, launch the visual selector
   let selection = try await launchRegionSelector()
-  debugLog("[handleSelectRecordAndAnalyze] Region selected: \(selection.width)x\(selection.height)")
 
   if selection.cancelled {
     return """
@@ -1190,69 +1009,42 @@ func handleSelectRecordAndAnalyze(
   )
 
   // Start recording
-  debugLog("[handleSelectRecordAndAnalyze] Starting recording...")
   let eventStream = try await screenRecorder.startRecordingWithEvents(
     region: region,
     config: recordingConfig,
     outputPath: nil
   )
-  debugLog("[handleSelectRecordAndAnalyze] Got eventStream, calling performRecording...")
-  let recordingResult = try await RecordingOrchestrator.performRecording(
+  let recordingPhase = try await RecordingOrchestrator.performRecording(
     eventStream: eventStream,
     durationSeconds: durationSeconds,
     maxDuration: mode.maxDuration,
     screenRecorder: screenRecorder
   )
-  debugLog("[handleSelectRecordAndAnalyze] Recording complete")
 
-  // Analyze video with cancellation support
-  do {
-    let result = try await RecordingOrchestrator.performAnalysisWithCancellation(
-      videoURL: recordingResult.url,
-      mode: mode,
-      context: "screen recording",
-      customPrompt: arguments["custom_prompt"]?.stringValue,
-      effectiveDuration: effectiveDuration,
-      frameExtractor: frameExtractor,
-      videoAnalyzer: videoAnalyzer,
-      statusUI: recordingResult.statusUI
-    )
+  // Analyze video (status UI will show "Analyzing..." during this phase)
+  let result = try await RecordingOrchestrator.performAnalysis(
+    videoURL: recordingPhase.url,
+    mode: mode,
+    context: "screen recording",
+    customPrompt: arguments["custom_prompt"]?.stringValue,
+    effectiveDuration: effectiveDuration,
+    frameExtractor: frameExtractor,
+    videoAnalyzer: videoAnalyzer,
+    statusUIHandle: recordingPhase.statusUIHandle
+  )
 
-    // Finalize UI with success
-    if let statusUI = recordingResult.statusUI {
-      await RecordingOrchestrator.finalizeWithUI(success: true, statusUI: statusUI)
-    }
+  let durationText = durationSeconds.map { "\($0) seconds" } ?? "manual (user stopped)"
 
-    let durationText = durationSeconds.map { "\($0) seconds" } ?? "manual (user stopped)"
+  return """
+    Screen region recording completed and analyzed!
 
-    return """
-      Screen region recording completed and analyzed!
+    Selected region: \(selection.x), \(selection.y) - \(selection.width)x\(selection.height)
+    Video file: \(recordingPhase.url.path)
+    Duration: \(durationText)
+    Analysis mode: \(mode.rawValue)
 
-      Selected region: \(selection.x), \(selection.y) - \(selection.width)x\(selection.height)
-      Video file: \(recordingResult.url.path)
-      Duration: \(durationText)
-      Analysis mode: \(mode.rawValue)
-
-      \(formatAnalysisResult(extraction: result.extraction, analysis: result.analysis))
-      """
-  } catch let error as AnalysisCancellationError {
-    // User cancelled - show cancelled state in UI briefly, then dismiss
-    // Do this in background so we can return to Claude Code immediately
-    if let statusUI = recordingResult.statusUI {
-      Task {
-        await statusUI.notifyCancelled()
-        try? await Task.sleep(for: .seconds(1))
-        await MainActor.run { statusUI.terminate() }
-      }
-    }
-    return error.localizedDescription
-  } catch {
-    // Analysis failed - show error in UI
-    if let statusUI = recordingResult.statusUI {
-      await RecordingOrchestrator.finalizeWithUI(success: false, statusUI: statusUI)
-    }
-    throw ToolError.invalidArgument("Video analysis failed: \(error.localizedDescription)")
-  }
+    \(formatAnalysisResult(extraction: result.extraction, analysis: result.analysis))
+    """
 }
 
 // MARK: - Helper Functions

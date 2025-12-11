@@ -27,23 +27,18 @@ jobs:
           swift build -c release --arch arm64 --arch x86_64 || true
 
           # Verify the build actually succeeded by checking artifacts exist
-          if [ ! -f ".build/apple/Products/Release/argus-mcp" ]; then
-            echo "Error: argus-mcp binary not found"
+          if [ ! -f ".build/apple/Products/Release/argus" ]; then
+            echo "Error: argus binary not found"
             exit 1
           fi
-          if [ ! -f ".build/apple/Products/Release/argus-select" ]; then
-            echo "Error: argus-select binary not found"
-            exit 1
-          fi
-          echo "Build verification passed - all binaries exist"
+          echo "Build verification passed - argus binary exists"
 
       - name: Prepare release artifacts
         run: |
           mkdir -p release-artifacts
-          cp .build/apple/Products/Release/argus-mcp release-artifacts/
-          cp .build/apple/Products/Release/argus-select release-artifacts/
+          cp .build/apple/Products/Release/argus release-artifacts/
           cd release-artifacts
-          tar -czvf argus-macos-universal.tar.gz argus-mcp argus-select
+          tar -czvf argus-macos-universal.tar.gz argus
           shasum -a 256 argus-macos-universal.tar.gz > argus-macos-universal.tar.gz.sha256
 
       - name: Create GitHub Release

@@ -6,8 +6,7 @@ set -e
 
 REPO="jamesrochabrun/Argus"
 INSTALL_DIR="$HOME/.local/bin"
-BINARY_NAME="argus-mcp"
-SELECT_BINARY="argus-select"
+BINARY_NAME="argus"
 
 # Colors for output
 RED='\033[0;31m'
@@ -45,17 +44,28 @@ TEMP_DIR=$(mktemp -d)
 curl -sL "$LATEST_URL" -o "$TEMP_DIR/argus.tar.gz"
 tar -xzf "$TEMP_DIR/argus.tar.gz" -C "$TEMP_DIR"
 
-# Install binaries
+# Remove old binaries if they exist (migration from 3-binary to single binary)
+if [[ -f "$INSTALL_DIR/argus-mcp" ]]; then
+    info "Removing old argus-mcp binary..."
+    rm -f "$INSTALL_DIR/argus-mcp"
+fi
+if [[ -f "$INSTALL_DIR/argus-select" ]]; then
+    info "Removing old argus-select binary..."
+    rm -f "$INSTALL_DIR/argus-select"
+fi
+if [[ -f "$INSTALL_DIR/argus-status" ]]; then
+    info "Removing old argus-status binary..."
+    rm -f "$INSTALL_DIR/argus-status"
+fi
+
+# Install binary
 mv "$TEMP_DIR/$BINARY_NAME" "$INSTALL_DIR/"
-mv "$TEMP_DIR/$SELECT_BINARY" "$INSTALL_DIR/"
 chmod +x "$INSTALL_DIR/$BINARY_NAME"
-chmod +x "$INSTALL_DIR/$SELECT_BINARY"
 
 # Cleanup
 rm -rf "$TEMP_DIR"
 
 success "Installed $BINARY_NAME to $INSTALL_DIR/"
-success "Installed $SELECT_BINARY to $INSTALL_DIR/"
 
 # Check if install dir is in PATH
 if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
@@ -86,6 +96,7 @@ echo -e "${GREEN}{
     \"argus\": {
       \"type\": \"stdio\",
       \"command\": \"$INSTALL_DIR/$BINARY_NAME\",
+      \"args\": [\"mcp\"],
       \"env\": {
         \"OPENAI_API_KEY\": \"YOUR_OPENAI_API_KEY\"
       }

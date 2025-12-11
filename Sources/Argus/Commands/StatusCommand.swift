@@ -1,42 +1,55 @@
 import AppKit
+import ArgumentParser
+import Foundation
 import SwiftUI
 
-// MARK: - Message Types
+// MARK: - Status Command
 
-/// Commands received from MCP server via stdin
-struct StatusCommand: Codable {
-  enum CommandType: String, Codable {
-    case configure   // Initial configuration
-    case recording   // First frame captured, start timer
-    case stop        // Recording stopped, close UI
-    case analyzing   // Show analyzing spinner
-    case success     // Show success checkmark
-    case error       // Show error state
-    case cancelled   // Show cancelled state briefly
+/// Status UI command - launched synchronously, blocks until user stops or timer ends
+struct StatusCommand: ParsableCommand {
+  static let configuration = CommandConfiguration(
+    commandName: "status",
+    abstract: "Launch recording status UI (blocks until stopped)"
+  )
+
+  @Option(name: .long, help: "Recording duration in seconds (omit for manual stop mode)")
+  var duration: Int?
+
+  func run() throws {
+    // IMPORTANT: We must run AppKit on the main thread.
+    // ArgumentParser may call run() on a background thread when using async main,
+    // so we use DispatchQueue.main.sync to hop to the main thread.
+    // NSApp.run() then blocks until NSApp.terminate() is called.
+    DispatchQueue.main.sync {
+      let app = NSApplication.shared
+      app.setActivationPolicy(.regular)
+
+      let delegate = StatusAppDelegate(durationSeconds: duration)
+      app.delegate = delegate
+      app.run()  // This blocks until NSApp.terminate() is called
+    }
   }
-
-  let type: CommandType
-  let durationSeconds: Int?  // nil = count-up mode, non-nil = countdown mode
 }
 
-/// Responses sent to MCP server via stdout
-struct StatusResponse: Codable {
-  enum ResponseType: String, Codable {
-    case ready         // UI is displayed and ready
-    case stopClicked   // User clicked stop button
-    case timeout       // Max duration (30s) reached
-    case cancelClicked // User clicked cancel button during analysis
+// MARK: - Status UI Result (Output)
+
+/// Result output when status UI exits
+struct StatusUIResult: Codable {
+  enum ResultType: String, Codable {
+    case stopped    // User clicked stop button
+    case timeout    // Max duration reached
+    case cancelled  // User cancelled
   }
 
-  let type: ResponseType
+  let result: ResultType
+  let elapsed: Int
 }
 
 // MARK: - Recording State
 
 enum RecordingState: Equatable {
-  case waiting
   case recording
-  case analyzing
+  case analyzing  // New state: recording done, analysis in progress
   case success
   case error
   case cancelled
@@ -46,7 +59,7 @@ enum RecordingState: Equatable {
 
 @MainActor
 class RecordingStateManager: ObservableObject {
-  @Published var state: RecordingState = .waiting
+  @Published var state: RecordingState = .recording
   @Published var elapsedSeconds: Int = 0
   @Published var targetDuration: Int?
 
@@ -71,14 +84,8 @@ class RecordingStateManager: ObservableObject {
     return String(format: "%02d:%02d", minutes, seconds)
   }
 
-  func configure(durationSeconds: Int?) {
+  func startRecording(durationSeconds: Int?) {
     targetDuration = durationSeconds
-    state = .waiting
-    elapsedSeconds = 0
-    showWarning = false
-  }
-
-  func startRecording() {
     state = .recording
     elapsedSeconds = 0
     showWarning = false
@@ -91,32 +98,38 @@ class RecordingStateManager: ObservableObject {
   }
 
   func setSuccess() {
+    stopTimer()
     state = .success
   }
 
   func setError() {
+    stopTimer()
     state = .error
   }
 
   func setCancelled() {
-    state = .cancelled
-  }
-
-  func stop() {
     stopTimer()
-    // Brief delay before closing
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-      NSApp.terminate(nil)
-    }
+    state = .cancelled
   }
 
   private func startTimer() {
     timer?.invalidate()
-    timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-      Task { @MainActor in
-        self?.timerTick()
-      }
+    // Use target/selector pattern which works reliably with MainActor
+    timer = Timer.scheduledTimer(
+      timeInterval: 1.0,
+      target: self,
+      selector: #selector(timerFired),
+      userInfo: nil,
+      repeats: true
+    )
+    // Ensure timer fires during UI interactions
+    if let timer = timer {
+      RunLoop.main.add(timer, forMode: .common)
     }
+  }
+
+  @objc private func timerFired() {
+    timerTick()
   }
 
   private func stopTimer() {
@@ -127,16 +140,22 @@ class RecordingStateManager: ObservableObject {
   private func timerTick() {
     elapsedSeconds += 1
 
-    // Check for warning threshold (count-up mode only)
+    // Check for countdown completion (timed mode)
+    if let target = targetDuration, elapsedSeconds >= target {
+      onTimeout?()
+      stopTimer()
+      return
+    }
+
+    // Check for warning threshold (manual mode only)
     if targetDuration == nil && elapsedSeconds == warningThreshold {
       showWarning = true
-      // Reset warning after animation
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
         self?.showWarning = false
       }
     }
 
-    // Check for max duration (count-up mode)
+    // Check for max duration (manual mode)
     if targetDuration == nil && elapsedSeconds >= maxDuration {
       onTimeout?()
       stopTimer()
@@ -152,7 +171,7 @@ class RecordingStateManager: ObservableObject {
   }
 }
 
-// MARK: - Visual Effect Blur (Fallback for pre-macOS 26)
+// MARK: - Visual Effect Blur
 
 struct VisualEffectBlur: NSViewRepresentable {
   let material: NSVisualEffectView.Material
@@ -213,8 +232,8 @@ struct RecordingStatusView: View {
 
   var body: some View {
     ZStack {
-      // Glass background with fallback
-      glassBackground()
+      // Glass background
+      VisualEffectBlur(material: .hudWindow, blendingMode: .behindWindow)
 
       // Content
       HStack(spacing: 12) {
@@ -222,23 +241,25 @@ struct RecordingStatusView: View {
         statusIndicator()
 
         // Status label
-        statusLabel()
+        Text(statusText)
+          .font(.system(size: 14, weight: .medium))
+          .foregroundStyle(.white)
+          .contentTransition(.interpolate)
 
         Spacer()
 
-        // Timer (only shown during waiting/recording)
-        if stateManager.state == .waiting || stateManager.state == .recording {
+        // Timer (during recording)
+        if stateManager.state == .recording {
           Text(stateManager.timerText)
             .font(.system(size: 18, weight: .semibold, design: .monospaced))
             .monospacedDigit()
             .foregroundStyle(.white)
-            .opacity(stateManager.state == .waiting ? 0.5 : 1.0)
             .contentTransition(.numericText())
             .animation(.easeInOut(duration: 0.2), value: stateManager.timerText)
         }
 
-        // Stop button (only during waiting/recording)
-        if stateManager.state == .waiting || stateManager.state == .recording {
+        // Stop button (during recording)
+        if stateManager.state == .recording {
           Button(action: {
             stateManager.handleStopClicked()
           }) {
@@ -248,22 +269,6 @@ struct RecordingStatusView: View {
               .padding(.horizontal, 14)
               .padding(.vertical, 6)
               .background(Color.red.opacity(0.8))
-              .clipShape(RoundedRectangle(cornerRadius: 8))
-          }
-          .buttonStyle(.plain)
-        }
-
-        // Cancel button (during analyzing/error states)
-        if stateManager.state == .analyzing || stateManager.state == .error {
-          Button(action: {
-            stateManager.handleCancelClicked()
-          }) {
-            Text("Cancel")
-              .font(.system(size: 13, weight: .medium))
-              .foregroundStyle(.white)
-              .padding(.horizontal, 14)
-              .padding(.vertical, 6)
-              .background(Color.orange.opacity(0.8))
               .clipShape(RoundedRectangle(cornerRadius: 8))
           }
           .buttonStyle(.plain)
@@ -289,28 +294,14 @@ struct RecordingStatusView: View {
   }
 
   @ViewBuilder
-  private func glassBackground() -> some View {
-    // Use NSVisualEffectView for blur effect
-    // Note: .glassEffect(.regular) requires macOS 26+ SDK which isn't available in CI yet
-    VisualEffectBlur(material: .hudWindow, blendingMode: .behindWindow)
-  }
-
-  @ViewBuilder
   private func statusIndicator() -> some View {
     switch stateManager.state {
-    case .waiting:
-      Circle()
-        .fill(Color.gray)
-        .frame(width: 12, height: 12)
-
     case .recording:
       PulsingDot(color: .red, isPulsing: true)
 
     case .analyzing:
-      ProgressView()
-        .progressViewStyle(.circular)
-        .scaleEffect(0.7)
-        .tint(.blue)
+      // Pulsing blue dot for analysis
+      PulsingDot(color: .blue, isPulsing: true)
 
     case .success:
       Image(systemName: "checkmark.circle.fill")
@@ -332,18 +323,8 @@ struct RecordingStatusView: View {
     }
   }
 
-  @ViewBuilder
-  private func statusLabel() -> some View {
-    Text(statusText)
-      .font(.system(size: 14, weight: .medium))
-      .foregroundStyle(.white)
-      .contentTransition(.interpolate)
-  }
-
   private var statusText: String {
     switch stateManager.state {
-    case .waiting:
-      return "Waiting..."
     case .recording:
       return "Recording"
     case .analyzing:
@@ -358,21 +339,26 @@ struct RecordingStatusView: View {
   }
 }
 
-// MARK: - App Delegate
+// MARK: - Status App Delegate
 
 @MainActor
-class AppDelegate: NSObject, NSApplicationDelegate {
+class StatusAppDelegate: NSObject, NSApplicationDelegate {
   var window: NSWindow?
   let stateManager = RecordingStateManager()
+  let durationSeconds: Int?
+  private var stdinSource: DispatchSourceRead?
 
-  nonisolated func applicationDidFinishLaunching(_ notification: Notification) {
-    Task { @MainActor in
-      await self.setupApp()
-    }
+  init(durationSeconds: Int?) {
+    self.durationSeconds = durationSeconds
+    super.init()
+  }
+
+  func applicationDidFinishLaunching(_ notification: Notification) {
+    setupApp()
   }
 
   private func setupApp() {
-    // Hide dock icon
+    // Hide dock icon but allow UI
     NSApp.setActivationPolicy(.accessory)
 
     // Create the SwiftUI view
@@ -401,22 +387,55 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     positionWindowAtTopCenter()
     window?.makeKeyAndOrderFront(nil)
 
+    // Activate the app to bring window to front
+    NSApp.activate(ignoringOtherApps: true)
+
     // Setup callbacks
     stateManager.onStopClicked = { [weak self] in
-      self?.sendResponse(.stopClicked)
+      self?.transitionToAnalyzing(result: .stopped)
     }
 
     stateManager.onTimeout = { [weak self] in
-      self?.sendResponse(.timeout)
+      self?.transitionToAnalyzing(result: .timeout)
     }
 
     stateManager.onCancelClicked = { [weak self] in
-      self?.sendResponse(.cancelClicked)
+      self?.exitImmediately(result: .cancelled)
     }
 
-    // Signal ready and start reading input
-    sendResponse(.ready)
-    startReadingInput()
+    // Start listening for stdin commands (for analysis completion signals)
+    setupStdinListener()
+
+    // Start recording immediately
+    stateManager.startRecording(durationSeconds: durationSeconds)
+  }
+
+  private func setupStdinListener() {
+    // Listen for commands from parent process on stdin
+    // Commands: "success\n" or "error\n"
+    let stdinFD = FileHandle.standardInput.fileDescriptor
+    stdinSource = DispatchSource.makeReadSource(fileDescriptor: stdinFD, queue: .main)
+
+    stdinSource?.setEventHandler { [weak self] in
+      guard let self = self else { return }
+
+      let data = FileHandle.standardInput.availableData
+      guard !data.isEmpty, let command = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+        return
+      }
+
+      // Handle commands from parent process
+      switch command {
+      case "success":
+        self.showSuccessAndExit()
+      case "error":
+        self.showErrorAndExit()
+      default:
+        break
+      }
+    }
+
+    stdinSource?.resume()
   }
 
   private func positionWindowAtTopCenter() {
@@ -427,79 +446,57 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     window.setFrameOrigin(NSPoint(x: x, y: y))
   }
 
-  private func startReadingInput() {
-    Task.detached {
-      let stdin = FileHandle.standardInput
-      var buffer = Data()
-
-      while true {
-        let data = stdin.availableData
-        guard !data.isEmpty else {
-          // stdin closed, exit
-          await MainActor.run {
-            NSApp.terminate(nil)
-          }
-          return
-        }
-
-        buffer.append(data)
-
-        // Process complete lines (newline-delimited JSON)
-        while let newlineIndex = buffer.firstIndex(of: UInt8(ascii: "\n")) {
-          let lineData = Data(buffer.prefix(upTo: newlineIndex))
-          buffer = Data(buffer.suffix(from: buffer.index(after: newlineIndex)))
-
-          if let command = try? JSONDecoder().decode(StatusCommand.self, from: lineData) {
-            await MainActor.run {
-              (NSApp.delegate as? AppDelegate)?.handleCommand(command)
-            }
-          }
-        }
-      }
-    }
-  }
-
-  private func handleCommand(_ command: StatusCommand) {
-    switch command.type {
-    case .configure:
-      stateManager.configure(durationSeconds: command.durationSeconds)
-
-    case .recording:
-      stateManager.startRecording()
-
-    case .analyzing:
-      stateManager.setAnalyzing()
-
-    case .success:
-      stateManager.setSuccess()
-
-    case .error:
-      stateManager.setError()
-
-    case .stop:
-      stateManager.stop()
-
-    case .cancelled:
-      stateManager.setCancelled()
-    }
-  }
-
-  private func sendResponse(_ type: StatusResponse.ResponseType) {
-    let response = StatusResponse(type: type)
+  /// Transition to analyzing state - output result but keep UI running
+  private func transitionToAnalyzing(result: StatusUIResult.ResultType) {
+    // Output the recording result to stdout so parent process knows recording stopped
+    let statusResult = StatusUIResult(result: result, elapsed: stateManager.elapsedSeconds)
     let encoder = JSONEncoder()
     encoder.outputFormatting = .sortedKeys
 
-    if let data = try? encoder.encode(response),
-       let json = String(data: data, encoding: .utf8) {
+    if let data = try? encoder.encode(statusResult),
+      let json = String(data: data, encoding: .utf8)
+    {
       print(json)
       fflush(stdout)
     }
+
+    // Transition to analyzing state - UI stays visible
+    stateManager.setAnalyzing()
+  }
+
+  /// Show success state briefly, then exit
+  private func showSuccessAndExit() {
+    stateManager.setSuccess()
+
+    // Brief delay to show success state
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+      Darwin.exit(0)
+    }
+  }
+
+  /// Show error state briefly, then exit
+  private func showErrorAndExit() {
+    stateManager.setError()
+
+    // Brief delay to show error state
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+      Darwin.exit(1)
+    }
+  }
+
+  /// Exit immediately without showing intermediate states (for cancel)
+  private func exitImmediately(result: StatusUIResult.ResultType) {
+    let statusResult = StatusUIResult(result: result, elapsed: stateManager.elapsedSeconds)
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = .sortedKeys
+
+    if let data = try? encoder.encode(statusResult),
+      let json = String(data: data, encoding: .utf8)
+    {
+      print(json)
+      fflush(stdout)
+    }
+
+    Darwin.exit(0)
   }
 }
-
-// MARK: - Main
-
-let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-app.run()

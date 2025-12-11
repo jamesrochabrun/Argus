@@ -2,14 +2,12 @@
 import PackageDescription
 
 let package = Package(
-  name: "ArgusMCP",
+  name: "Argus",
   platforms: [
     .macOS(.v14),
   ],
   products: [
-    .executable(name: "argus-mcp", targets: ["ArgusMCP"]),
-    .executable(name: "argus-select", targets: ["ArgusSelect"]),
-    .executable(name: "argus-status", targets: ["ArgusRecordingStatus"]),
+    .executable(name: "argus", targets: ["Argus"]),
   ],
   dependencies: [
     .package(url: "https://github.com/modelcontextprotocol/swift-sdk", from: "0.7.1"),
@@ -18,22 +16,23 @@ let package = Package(
   ],
   targets: [
     .executableTarget(
+      name: "Argus",
+      dependencies: [
+        .product(name: "MCP", package: "swift-sdk"),
+        .product(name: "ArgumentParser", package: "swift-argument-parser"),
+        .product(name: "SwiftOpenAI", package: "SwiftOpenAI"),
+        "ArgusMCP",
+      ],
+      path: "Sources/Argus"
+    ),
+    .target(
       name: "ArgusMCP",
       dependencies: [
         .product(name: "MCP", package: "swift-sdk"),
         .product(name: "ArgumentParser", package: "swift-argument-parser"),
         .product(name: "SwiftOpenAI", package: "SwiftOpenAI"),
-      ]
-    ),
-    .executableTarget(
-      name: "ArgusSelect",
-      dependencies: [
-        .product(name: "ArgumentParser", package: "swift-argument-parser"),
-      ]
-    ),
-    .executableTarget(
-      name: "ArgusRecordingStatus",
-      dependencies: []
+      ],
+      path: "Sources/ArgusMCP"
     ),
   ]
 )
