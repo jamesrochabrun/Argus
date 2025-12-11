@@ -70,6 +70,7 @@ public final class RecordingStatusUI {
     }
 
     let executablePath = try getExecutablePath()
+    FileHandle.standardError.write("[RecordingStatusUI] Launching UI from: \(executablePath)\n".data(using: .utf8)!)
 
     process = Process()
     process?.executableURL = URL(fileURLWithPath: executablePath)
@@ -94,6 +95,7 @@ public final class RecordingStatusUI {
 
     try process?.run()
     isRunning = true
+    FileHandle.standardError.write("[RecordingStatusUI] Process started, pid: \(process?.processIdentifier ?? -1)\n".data(using: .utf8)!)
 
     // Start reading responses in background
     startReadingOutput()
@@ -104,6 +106,7 @@ public final class RecordingStatusUI {
       durationSeconds: config.durationSeconds
     )
     try await sendCommand(configCommand)
+    FileHandle.standardError.write("[RecordingStatusUI] Configure command sent\n".data(using: .utf8)!)
 
     return stream
   }
@@ -147,6 +150,9 @@ public final class RecordingStatusUI {
   /// Get a fresh event stream for analysis phase
   /// This creates a new continuation that will receive cancelClicked events
   public func getAnalysisEventStream() -> AsyncStream<UIEvent> {
+    // Finish any existing continuation to prevent leaks
+    analysisContinuation?.finish()
+
     let (stream, continuation) = AsyncStream<UIEvent>.makeStream()
     self.analysisContinuation = continuation
     return stream
@@ -288,6 +294,8 @@ public final class RecordingStatusUI {
                 // Yield to BOTH continuations so analysis phase can receive cancel events
                 self?.eventContinuation?.yield(.cancelClicked)
                 self?.analysisContinuation?.yield(.cancelClicked)
+                // Finish the analysis continuation after cancel to prevent leaks
+                self?.analysisContinuation?.finish()
               }
             }
           }
