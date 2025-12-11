@@ -1,5 +1,36 @@
 import AppKit
+import ArgumentParser
 import Foundation
+
+// MARK: - Select Command
+
+struct SelectCommand: ParsableCommand {
+  static let configuration = CommandConfiguration(
+    commandName: "select",
+    abstract: "Launch region selector UI"
+  )
+
+  func run() throws {
+    FileHandle.standardError.write("[SelectCommand] run() called\n".data(using: .utf8)!)
+
+    // IMPORTANT: We must run AppKit on the main thread.
+    // ArgumentParser may call run() on a background thread when using async main,
+    // so we use DispatchQueue.main.sync to hop to the main thread.
+    // NSApp.run() then blocks until NSApp.terminate() is called.
+    DispatchQueue.main.sync {
+      FileHandle.standardError.write("[SelectCommand] Inside DispatchQueue.main.sync\n".data(using: .utf8)!)
+
+      let app = NSApplication.shared
+      app.setActivationPolicy(.regular)
+
+      let delegate = SelectAppDelegate()
+      app.delegate = delegate
+
+      FileHandle.standardError.write("[SelectCommand] Calling app.run()\n".data(using: .utf8)!)
+      app.run()  // This blocks until NSApp.terminate() is called
+    }
+  }
+}
 
 // MARK: - Selection Result
 
@@ -46,7 +77,6 @@ class SelectionView: NSView {
 
   private let selectionColor = NSColor.systemBlue
   private let crosshairColor = NSColor.white
-  private let gridColor = NSColor.white.withAlphaComponent(0.3)
 
   var onSelectionComplete: ((NSRect) -> Void)?
   var onCancel: (() -> Void)?
@@ -83,7 +113,7 @@ class SelectionView: NSView {
 
   private func setupKeyMonitor() {
     keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-      if event.keyCode == 53 { // ESC key
+      if event.keyCode == 53 {  // ESC key
         self?.cancelAndExit()
         return nil  // Consume the event
       }
@@ -138,7 +168,7 @@ class SelectionView: NSView {
         NSPoint(x: selectionRect.minX, y: selectionRect.minY),
         NSPoint(x: selectionRect.maxX, y: selectionRect.minY),
         NSPoint(x: selectionRect.minX, y: selectionRect.maxY),
-        NSPoint(x: selectionRect.maxX, y: selectionRect.maxY)
+        NSPoint(x: selectionRect.maxX, y: selectionRect.maxY),
       ]
 
       for corner in corners {
@@ -160,7 +190,7 @@ class SelectionView: NSView {
 
       let attributes: [NSAttributedString.Key: Any] = [
         .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .medium),
-        .foregroundColor: NSColor.white
+        .foregroundColor: NSColor.white,
       ]
 
       let textSize = dimensionText.size(withAttributes: attributes)
@@ -221,7 +251,7 @@ class SelectionView: NSView {
     let coordText = "(\(Int(point.x)), \(Int(point.y)))"
     let attributes: [NSAttributedString.Key: Any] = [
       .font: NSFont.monospacedSystemFont(ofSize: 10, weight: .regular),
-      .foregroundColor: NSColor.white
+      .foregroundColor: NSColor.white,
     ]
 
     let textSize = coordText.size(withAttributes: attributes)
@@ -245,7 +275,7 @@ class SelectionView: NSView {
     let instructions = "Drag to select region • ESC to cancel"
     let attributes: [NSAttributedString.Key: Any] = [
       .font: NSFont.systemFont(ofSize: 14, weight: .medium),
-      .foregroundColor: NSColor.white
+      .foregroundColor: NSColor.white,
     ]
 
     let textSize = instructions.size(withAttributes: attributes)
@@ -318,32 +348,35 @@ class SelectionView: NSView {
   // MARK: - Keyboard Events
 
   override func keyDown(with event: NSEvent) {
-    if event.keyCode == 53 { // ESC key
+    if event.keyCode == 53 {  // ESC key
       cancelAndExit()
     }
   }
 
   override func flagsChanged(with event: NSEvent) {
-    // Handle modifier keys if needed, but don't block ESC
     super.flagsChanged(with: event)
   }
 }
 
-// MARK: - App Delegate
+// MARK: - Select App Delegate
 
-class AppDelegate: NSObject, NSApplicationDelegate {
+class SelectAppDelegate: NSObject, NSApplicationDelegate {
   var overlayWindows: [SelectionOverlayWindow] = []
 
   func applicationDidFinishLaunching(_ notification: Notification) {
+    FileHandle.standardError.write("[SelectCommand] applicationDidFinishLaunching\n".data(using: .utf8)!)
+
     // Hide dock icon
     NSApp.setActivationPolicy(.accessory)
 
     // Create overlay on main screen
     guard let mainScreen = NSScreen.main else {
+      FileHandle.standardError.write("[SelectCommand] ERROR: No main screen found\n".data(using: .utf8)!)
       outputError("No main screen found")
       NSApp.terminate(nil)
       return
     }
+    FileHandle.standardError.write("[SelectCommand] Main screen: \(mainScreen.frame)\n".data(using: .utf8)!)
 
     let window = SelectionOverlayWindow(screen: mainScreen)
     let selectionView = SelectionView(frame: mainScreen.frame)
@@ -362,11 +395,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     overlayWindows.append(window)
 
+    FileHandle.standardError.write("[SelectCommand] Window created, activating app...\n".data(using: .utf8)!)
+
     // Activate app
     NSApp.activate(ignoringOtherApps: true)
 
     // Set crosshair cursor
     NSCursor.crosshair.set()
+
+    FileHandle.standardError.write("[SelectCommand] App activated, crosshair set\n".data(using: .utf8)!)
   }
 
   @MainActor
@@ -386,7 +423,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     )
 
     outputResult(result)
-    NSApp.terminate(nil)
+    // Use Darwin.exit for clean exit when launched via DispatchQueue.main.sync
+    Darwin.exit(0)
   }
 
   @MainActor
@@ -404,7 +442,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
       )
 
       self.outputResult(result)
-      NSApp.terminate(nil)
+      // Use Darwin.exit for clean exit when launched via DispatchQueue.main.sync
+      Darwin.exit(0)
     }
   }
 
@@ -413,7 +452,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     encoder.outputFormatting = .sortedKeys
 
     if let data = try? encoder.encode(result),
-       let json = String(data: data, encoding: .utf8) {
+      let json = String(data: data, encoding: .utf8)
+    {
       print(json)
     }
   }
@@ -422,10 +462,3 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     FileHandle.standardError.write("Error: \(message)\n".data(using: .utf8)!)
   }
 }
-
-// MARK: - Main
-
-let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-app.run()

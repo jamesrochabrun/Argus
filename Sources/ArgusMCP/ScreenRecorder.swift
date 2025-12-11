@@ -816,6 +816,15 @@ private class StreamOutput: NSObject, SCStreamOutput {
     stoppedLock.unlock()
   }
 
+  private func debugLog(_ msg: String) {
+    let line = "[\(Date())] [StreamOutput] \(msg)\n"
+    if let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: "/tmp/argus-debug.log")) {
+      handle.seekToEndOfFile()
+      handle.write(line.data(using: .utf8)!)
+      handle.closeFile()
+    }
+  }
+
   func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
     guard type == .screen else { return }
 
@@ -826,11 +835,11 @@ private class StreamOutput: NSObject, SCStreamOutput {
     guard !stopped else { return }
 
     guard assetWriter.status == .writing else {
-      FileHandle.standardError.write("Debug: Frame dropped - assetWriter status: \(assetWriter.status.rawValue)\n".data(using: .utf8)!)
+      debugLog("Frame dropped - assetWriter status: \(assetWriter.status.rawValue)")
       return
     }
     guard videoInput.isReadyForMoreMediaData else {
-      FileHandle.standardError.write("Debug: Frame dropped - videoInput not ready\n".data(using: .utf8)!)
+      debugLog("Frame dropped - videoInput not ready")
       return
     }
 
@@ -838,6 +847,7 @@ private class StreamOutput: NSObject, SCStreamOutput {
 
     if firstTimestamp == nil {
       firstTimestamp = timestamp
+      debugLog("FIRST FRAME CAPTURED! Calling callback...")
 
       // Thread-safe first frame notification (only once)
       if let callback = onFirstFrame {
@@ -847,6 +857,7 @@ private class StreamOutput: NSObject, SCStreamOutput {
         notificationLock.unlock()
 
         if shouldNotify {
+          debugLog("Invoking onFirstFrame callback")
           callback()
         }
       }
