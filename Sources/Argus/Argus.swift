@@ -6,7 +6,7 @@ struct Argus: AsyncParsableCommand {
   static let configuration = CommandConfiguration(
     commandName: "argus",
     abstract: "Video analysis MCP server for Claude Code",
-    version: "1.1.0",
+    version: "2.1.0",
     subcommands: [
       MCPCommand.self,
       StatusCommand.self,

@@ -137,7 +137,7 @@ public func runMCPServer() async throws {
   // Create server with tool capabilities
   let server = Server(
     name: "argus",
-    version: "2.0.0",
+    version: "2.1.0",
     capabilities: Server.Capabilities(tools: .init())
   )
 
