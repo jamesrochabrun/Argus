@@ -22,10 +22,18 @@ error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
 # Check macOS
 if [[ "$(uname)" != "Darwin" ]]; then
-    error "Argus only supports macOS (uses ScreenCaptureKit for screen recording)"
+    error "Argus only supports macOS"
 fi
 
 info "Installing Argus MCP Server..."
+
+# Check for ffmpeg
+if ! command -v ffmpeg &> /dev/null; then
+    warn "ffmpeg not found (required for video processing)"
+    echo ""
+    echo "Install with: brew install ffmpeg"
+    echo ""
+fi
 
 # Get latest release URL
 info "Fetching latest release..."
@@ -45,18 +53,12 @@ curl -sL "$LATEST_URL" -o "$TEMP_DIR/argus.tar.gz"
 tar -xzf "$TEMP_DIR/argus.tar.gz" -C "$TEMP_DIR"
 
 # Remove old binaries if they exist (migration from 3-binary to single binary)
-if [[ -f "$INSTALL_DIR/argus-mcp" ]]; then
-    info "Removing old argus-mcp binary..."
-    rm -f "$INSTALL_DIR/argus-mcp"
-fi
-if [[ -f "$INSTALL_DIR/argus-select" ]]; then
-    info "Removing old argus-select binary..."
-    rm -f "$INSTALL_DIR/argus-select"
-fi
-if [[ -f "$INSTALL_DIR/argus-status" ]]; then
-    info "Removing old argus-status binary..."
-    rm -f "$INSTALL_DIR/argus-status"
-fi
+for old_binary in "argus-mcp" "argus-select" "argus-status"; do
+    if [[ -f "$INSTALL_DIR/$old_binary" ]]; then
+        info "Removing old $old_binary binary..."
+        rm -f "$INSTALL_DIR/$old_binary"
+    fi
+done
 
 # Install binary
 mv "$TEMP_DIR/$BINARY_NAME" "$INSTALL_DIR/"
@@ -78,18 +80,10 @@ if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
 fi
 
 # Claude configuration
-CLAUDE_CONFIG="$HOME/.claude.json"
 echo ""
 info "Claude Code Configuration"
 echo ""
-
-if [[ -f "$CLAUDE_CONFIG" ]]; then
-    info "Found existing ~/.claude.json"
-else
-    info "No ~/.claude.json found"
-fi
-
-echo "To use Argus with Claude Code, add this to your ~/.claude.json:"
+echo "Add this to ~/.claude.json:"
 echo ""
 echo -e "${GREEN}{
   \"mcpServers\": {
@@ -104,13 +98,13 @@ echo -e "${GREEN}{
   }
 }${NC}"
 echo ""
-warn "Remember to replace YOUR_OPENAI_API_KEY with your actual OpenAI API key"
-echo ""
+warn "Replace YOUR_OPENAI_API_KEY with your actual key"
 info "Get your API key at: https://platform.openai.com/api-keys"
 echo ""
 success "Installation complete!"
 echo ""
 echo "Next steps:"
-echo "  1. Add the configuration above to ~/.claude.json"
-echo "  2. Restart Claude Code"
-echo "  3. Use: record_and_analyze, select_record_and_analyze, or analyze_video"
+echo "  1. Install ffmpeg if not already: brew install ffmpeg"
+echo "  2. Add the config above to ~/.claude.json"
+echo "  3. Restart Claude Code"
+echo "  4. Try: analyze_video or design_from_video"
