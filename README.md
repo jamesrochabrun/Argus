@@ -1,6 +1,6 @@
 # Argus
 
-<img width="2058" height="830" alt="Image" src="https://github.com/user-attachments/assets/8fd7f8fe-612a-42eb-b97e-7e54869cd383" />
+<img width="2058" height="830" alt="Image" src="https://github.com/user-attachments/assets/8fd7f2fe-612a-42eb-b97e-7e54869cd383" />
 
 A MCP (Model Context Protocol) server for analyzing videos and extracting UI/animation design specifications using OpenAI's Vision API.
 
