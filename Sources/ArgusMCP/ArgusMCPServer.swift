@@ -110,6 +110,9 @@ public func runMCPServer() async throws {
         Two modes:
         - 'quick': Fast analysis (~$0.003) - Good for simple transitions
         - 'high_detail': Detailed analysis (~$0.01) - Better for complex animations
+
+        A preflight check runs automatically. If the video may exceed token limits,
+        you'll get recommendations before any processing or billing occurs.
         """,
       inputSchema: .object([
         "type": "object",
@@ -126,6 +129,10 @@ public func runMCPServer() async throws {
           "focus_hint": .object([
             "type": "string",
             "description": "Optional hint about which element to focus on (e.g., 'the blue button')"
+          ]),
+          "force_proceed": .object([
+            "type": "boolean",
+            "description": "Skip preflight warnings and proceed anyway (default: false). Use when you've reviewed the preflight warning and want to proceed despite potential limit issues."
           ])
         ]),
         "required": .array(["video_path", "mode"])
@@ -281,6 +288,9 @@ func handleDesignFromVideo(
     throw ToolError.missingArgument("mode")
   }
 
+  // Check for force_proceed flag (defaults to false)
+  let forceProceed = arguments["force_proceed"]?.boolValue ?? false
+
   let url = URL(fileURLWithPath: videoPath)
 
   // Check if file exists
@@ -296,6 +306,21 @@ func handleDesignFromVideo(
 
   // Validate video
   try await ffmpegProcessor.validate(metadata, maxDuration: 120)
+
+  // PREFLIGHT CHECK: Estimate tokens before any expensive operations
+  // This prevents wasted API calls and money when video would exceed limits
+  if !forceProceed {
+    let preflightResult = PreflightCheck.check(
+      duration: metadata.duration,
+      mode: mode.samplerMode,
+      limits: mode.costLimits
+    )
+
+    if case .needsConfirmation(let info) = preflightResult {
+      // Return preflight warning - no frames extracted, no API calls made
+      return formatPreflightWarning(info: info, videoPath: videoPath)
+    }
+  }
 
   // Create sampling plan
   let plan = FrameSampler.createPlan(duration: metadata.duration, mode: mode.samplerMode)
@@ -495,6 +520,54 @@ private func describeElementAnimation(_ element: AnimatedElement) -> String {
   }
 
   return descriptions.isEmpty ? "animates" : descriptions.joined(separator: ", ")
+}
+
+/// Format preflight warning message when video may exceed limits
+func formatPreflightWarning(info: PreflightInfo, videoPath: String) -> String {
+  var message = """
+    ## Preflight Check - Action Required
+
+    This video will likely exceed **\(info.requestedMode)** mode token limits.
+    No frames were extracted and no API calls were made.
+
+    ### Estimates
+    | Metric | Value |
+    |--------|-------|
+    | Video Duration | \(String(format: "%.1f", info.duration))s |
+    | Frames to Extract | \(info.frameCount) |
+    | Vision API Calls | \(info.visionCalls) |
+    | Estimated Input Tokens | ~\(info.estimatedTokens) |
+    | Mode Token Limit | \(info.limit) |
+    | Usage | \(String(format: "%.0f", info.percentageOfLimit))% of limit |
+    | Estimated Cost | $\(String(format: "%.4f", info.estimatedCostUSD)) |
+
+    ### Recommendations
+    """
+
+  for (index, rec) in info.recommendations.enumerated() {
+    message += "\n\(index + 1). \(rec.description)"
+  }
+
+  message += """
+
+
+    ### How to Proceed
+
+    **Option 1: Use quick mode** (recommended for most videos)
+    ```
+    design_from_video(video_path: "\(videoPath)", mode: "quick")
+    ```
+
+    **Option 2: Force proceed** (accepts risk of mid-analysis failure)
+    ```
+    design_from_video(video_path: "\(videoPath)", mode: "\(info.requestedMode)", force_proceed: true)
+    ```
+
+    **Option 3: Reduce video length**
+    Trim your video to a shorter duration before analysis.
+    """
+
+  return message
 }
 
 // MARK: - Setup Command
