@@ -139,6 +139,31 @@ public func runMCPServer() async throws {
       ])
     ),
 
+    // Tool 3: capture_cursor_context - Capture cursor region and full screen
+    MCPTool(
+      name: "capture_cursor_context",
+      description: """
+        Capture the current cursor context for visual UI understanding.
+        Returns two images:
+        1. A 600x600 pixel region centered on the cursor (what the user is pointing at)
+        2. A full screenshot of the display for broader context
+
+        Both images include the cursor. Fast capture (~200ms).
+        Use this when a user points at a UI element and wants to discuss it
+        without needing to describe it verbally.
+
+        **Workflow:** When called, a crosshair overlay appears. The user moves
+        the cursor to the target element and clicks to mark the position.
+        The screenshot is then captured at that exact position.
+        This solves the issue of the cursor moving when accepting tool requests.
+        """,
+      inputSchema: .object([
+        "type": "object",
+        "properties": .object([:]),
+        "required": .array([])
+      ])
+    ),
+
   ]
 
   // Create server with tool capabilities
@@ -203,6 +228,9 @@ func handleToolCall(
       ffmpegProcessor: ffmpegProcessor,
       codeGenAnalyzer: codeGenAnalyzer
     )
+
+  case "capture_cursor_context":
+    return try await handleCaptureCursorContext()
 
   default:
     throw ToolError.unknownTool(name)
@@ -369,7 +397,41 @@ func handleDesignFromVideo(
   )
 }
 
+/// Handle capture_cursor_context tool - capture cursor region and full screen
+func handleCaptureCursorContext() async throws -> String {
+  cleanupOrphanProcesses()
+
+  let capture = CursorContextCapture()
+  let result = try await capture.capture()
+
+  return formatCursorContextResult(result)
+}
+
 // MARK: - Helper Functions
+
+/// Format cursor context capture result
+func formatCursorContextResult(_ result: CursorContextCapture.CaptureResult) -> String {
+  let screenType = result.screenInfo.isMain ? "main display" : "secondary display"
+
+  return """
+    ## Cursor Context Captured
+
+    ### Capture Information
+    - Cursor Position: (\(Int(result.cursorPosition.x)), \(Int(result.cursorPosition.y)))
+    - Screen: \(result.screenInfo.width)x\(result.screenInfo.height) (\(screenType))
+    - Scale Factor: \(result.screenInfo.scaleFactor)x
+    - Region Captured: \(Int(result.actualRegionRect.width))x\(Int(result.actualRegionRect.height)) at (\(Int(result.actualRegionRect.origin.x)), \(Int(result.actualRegionRect.origin.y)))
+    - Capture Time: \(String(format: "%.0f", result.captureTime * 1000))ms
+
+    ### Images
+
+    **Region (\(Int(result.actualRegionRect.width))x\(Int(result.actualRegionRect.height)) centered on cursor):**
+    ![Cursor Region](\(result.regionImagePath.path))
+
+    **Full Screen:**
+    ![Full Screen](\(result.fullScreenImagePath.path))
+    """
+}
 
 /// Format simple analysis result for analyze_video tool
 func formatSimpleAnalysisResult(

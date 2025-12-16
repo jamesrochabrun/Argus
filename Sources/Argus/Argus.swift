@@ -11,6 +11,7 @@ struct Argus: AsyncParsableCommand {
       MCPCommand.self,
       StatusCommand.self,
       SelectCommand.self,
+      PickPositionCommand.self,
     ],
     defaultSubcommand: MCPCommand.self
   )
