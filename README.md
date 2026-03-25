@@ -86,6 +86,10 @@ swift build -c release
 
 ---
 
+## Acknowledgments
+
+Thanks to the Swift community for the continued support and inspiration.
+
 ## License
 
 MIT
